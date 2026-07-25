@@ -1,9 +1,9 @@
 // Minimal URDF -> three.js loader.
 //
-// Covers the subset onshape-to-robot emits (which is what the SO-101 uses):
-// named materials, link <visual> lists with mesh/box/cylinder/sphere geometry,
-// and fixed/revolute/continuous/prismatic joints. Collision geometry is ignored —
-// the scene raycasts against the visual meshes directly.
+// Covers what our robot packages actually emit: named materials, link <visual>
+// lists with mesh (.stl / .obj) / box / cylinder / sphere geometry, and
+// fixed/revolute/continuous/prismatic joints with <mimic> coupling. Collision
+// geometry is ignored — the scene raycasts against the visual meshes directly.
 //
 // The URDF is parsed and its meshes fetched ONCE into a `URDFAsset`; every
 // `asset.build()` spawns a fresh instance that shares geometries and materials,
@@ -11,6 +11,8 @@
 
 import * as THREE from 'three';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 
 // ---------------------------------------------------------------- xml helpers
 const childrenByTag = (el, tag) => Array.from(el.children).filter((c) => c.tagName === tag);
@@ -87,6 +89,9 @@ function parseURDF(text, baseURL) {
     if (!parent || !child) continue;
     const limitEl = childByTag(j, 'limit');
     const axis = numbers(childByTag(j, 'axis') && childByTag(j, 'axis').getAttribute('xyz'), [1, 0, 0]);
+    // <mimic> couples this joint to another (coupled gripper fingers, four-bar
+    // linkages). Loaders that skip it report a DOF that is not really commandable.
+    const mimicEl = childByTag(j, 'mimic');
     joints.push({
       name: j.getAttribute('name'),
       type: j.getAttribute('type') || 'fixed',
@@ -95,6 +100,11 @@ function parseURDF(text, baseURL) {
       axis: new THREE.Vector3().fromArray(axis),
       lower: limitEl ? Number(limitEl.getAttribute('lower') || 0) : 0,
       upper: limitEl ? Number(limitEl.getAttribute('upper') || 0) : 0,
+      mimic: mimicEl ? {
+        joint: mimicEl.getAttribute('joint'),
+        multiplier: Number(mimicEl.getAttribute('multiplier') ?? 1) || 1,
+        offset: Number(mimicEl.getAttribute('offset') ?? 0) || 0,
+      } : null,
       ...originOf(j),
     });
   }
@@ -133,6 +143,7 @@ export class URDFRobot extends THREE.Group {
     this.isURDFRobot = true;
     this.links = new Map();
     this.joints = new Map();
+    this.followers = new Map(); // joint name -> [{ name, multiplier, offset }]
   }
 
   setJointValue(name, value) {
@@ -145,7 +156,17 @@ export class URDFRobot extends THREE.Group {
     } else {
       j.node.quaternion.copy(j.quat).multiply(_q.setFromAxisAngle(j.axis, v));
     }
+    // drag any joint that mimics this one along with it (one level: URDF forbids
+    // a mimic joint from itself being mimicked, so this cannot recurse)
+    for (const f of this.followers.get(name) || []) {
+      this.setJointValue(f.name, v * f.multiplier + f.offset);
+    }
     return true;
+  }
+
+  /** Joints you can actually command — mimic followers move on their own. */
+  get drivenJoints() {
+    return new Map([...this.joints].filter(([, j]) => !j.mimic));
   }
 
   resetJoints() {
@@ -158,9 +179,11 @@ const _axisWorld = new THREE.Vector3();
 
 // ---------------------------------------------------------------- asset
 export class URDFAsset {
-  constructor(spec, geometries) {
+  constructor(spec, meshes) {
     this.spec = spec;
-    this.geometries = geometries; // url -> BufferGeometry
+    // url -> BufferGeometry (.stl, colour comes from the URDF) or Object3D
+    // prototype (.obj, colour comes from its own .mtl)
+    this.meshes = meshes;
     this.materials = new Map();
     this.name = spec.name;
   }
@@ -184,11 +207,41 @@ export class URDFAsset {
 
   geometryFor(visual) {
     const g = visual.geom;
-    if (g.type === 'mesh') return this.geometries.get(g.url) || null;
+    if (g.type === 'mesh') {
+      const m = this.meshes.get(g.url);
+      return m && m.isBufferGeometry ? m : null;
+    }
     if (g.type === 'box') return new THREE.BoxGeometry(...g.size);
     if (g.type === 'sphere') return new THREE.SphereGeometry(g.radius, 24, 16);
     if (g.type === 'cylinder') return new THREE.CylinderGeometry(g.radius, g.radius, g.length, 24);
     return null;
+  }
+
+  /**
+   * One visual as a scene node. OBJ visuals arrive as a prototype Object3D that
+   * already carries its own MTL colours; cloning shares geometry and materials,
+   * so extra copies are cheap. Everything else is a single Mesh.
+   */
+  nodeFor(visual, materialOverride) {
+    const g = visual.geom;
+    const proto = g.type === 'mesh' ? this.meshes.get(g.url) : null;
+
+    if (proto && proto.isObject3D) {
+      const node = proto.clone(true);
+      // a URDF <material> on the visual outranks the file's own materials
+      const override = materialOverride || (visual.rgba ? this.materialFor(visual) : null);
+      if (override) node.traverse((o) => { if (o.isMesh) o.material = override; });
+      node.scale.fromArray(g.scale);
+      return node;
+    }
+
+    const geometry = this.geometryFor(visual);
+    if (!geometry) return null;
+    const mesh = new THREE.Mesh(geometry, materialOverride || this.materialFor(visual));
+    // URDF cylinders run along +Z; three.js builds them along +Y
+    if (g.type === 'cylinder') mesh.rotation.x = Math.PI / 2;
+    if (g.type === 'mesh') mesh.scale.fromArray(g.scale);
+    return mesh;
   }
 
   // `materialOverride` renders the whole robot in one material (used for the
@@ -213,17 +266,13 @@ export class URDFAsset {
 
     const spec = this.spec.links.get(linkName);
     for (const v of (spec ? spec.visuals : [])) {
-      const geometry = this.geometryFor(v);
-      if (!geometry) continue;
-      const mesh = new THREE.Mesh(geometry, materialOverride || this.materialFor(v));
-      mesh.name = `${linkName}_visual`;
-      // URDF cylinders run along +Z; three.js builds them along +Y
-      if (v.geom.type === 'cylinder') mesh.rotation.x = Math.PI / 2;
-      if (v.geom.type === 'mesh') mesh.scale.fromArray(v.geom.scale);
+      const visual = this.nodeFor(v, materialOverride);
+      if (!visual) continue;
+      visual.name = `${linkName}_visual`;
       const node = new THREE.Group();
       node.position.copy(v.pos);
       node.quaternion.copy(v.quat);
-      node.add(mesh);
+      node.add(visual);
       link.add(node);
     }
 
@@ -243,14 +292,78 @@ export class URDFAsset {
           quat: j.quat.clone(),
           lower: j.type === 'continuous' ? -Math.PI : j.lower,
           upper: j.type === 'continuous' ? Math.PI : j.upper,
+          mimic: j.mimic,
           value: 0,
         });
+        if (j.mimic) {
+          const list = robot.followers.get(j.mimic.joint) || [];
+          list.push({ name: j.name, multiplier: j.mimic.multiplier, offset: j.mimic.offset });
+          robot.followers.set(j.mimic.joint, list);
+        }
       }
     }
 
     visiting.delete(linkName);
     return link;
   }
+}
+
+// ---------------------------------------------------------------- mesh loading
+// main.js installs three-mesh-bvh on the prototype; use it when present so
+// dragging an arm around raycasts against it cheaply.
+function prepareGeometry(geometry) {
+  if (!geometry.attributes.normal) geometry.computeVertexNormals();
+  if (geometry.computeBoundsTree) geometry.computeBoundsTree();
+  return geometry;
+}
+
+async function loadSTL(url) {
+  const geometry = await new STLLoader().loadAsync(url);
+  geometry.computeVertexNormals(); // STL face normals are per-facet and often stale
+  return prepareGeometry(geometry);
+}
+
+// OBJ carries its own materials in a side-car .mtl. Read the file first so the
+// `mtllib` line names it — deriving the name from the .obj path guesses wrong on
+// packages where several meshes share one library.
+async function loadOBJ(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`mesh fetch failed: ${res.status} ${url}`);
+  const text = await res.text();
+
+  const loader = new OBJLoader();
+  const lib = text.match(/^\s*mtllib\s+(.+?)\s*$/m);
+  if (lib) {
+    try {
+      const materials = await new MTLLoader().loadAsync(new URL(lib[1], url).href);
+      materials.preload();
+      loader.setMaterials(materials);
+    } catch (err) {
+      console.warn(`URDF: could not load materials for ${url} — using default grey`, err);
+    }
+  }
+
+  const root = loader.parse(text);
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    prepareGeometry(o.geometry);
+    // MTLLoader hands back Phong; the rest of the scene is lit as Standard
+    const src = Array.isArray(o.material) ? o.material[0] : o.material;
+    o.material = new THREE.MeshStandardMaterial({
+      color: src && src.color ? src.color.clone() : new THREE.Color(0.75, 0.75, 0.78),
+      metalness: 0.15,
+      roughness: 0.55,
+      opacity: src && src.opacity != null ? src.opacity : 1,
+      transparent: !!(src && src.opacity != null && src.opacity < 1),
+    });
+  });
+  return root;
+}
+
+function loadMesh(url) {
+  if (/\.stl(\?|$)/i.test(url)) return loadSTL(url);
+  if (/\.obj(\?|$)/i.test(url)) return loadOBJ(url);
+  return Promise.reject(new Error(`unsupported URDF mesh format: ${url}`));
 }
 
 // ---------------------------------------------------------------- entry point
@@ -260,21 +373,15 @@ export async function loadURDF(url, { onProgress } = {}) {
   if (!res.ok) throw new Error(`URDF fetch failed: ${res.status} ${baseURL}`);
   const spec = parseURDF(await res.text(), baseURL);
 
-  const stl = new STLLoader();
   const urls = [...spec.meshURLs];
-  const geometries = new Map();
+  const meshes = new Map();
   let done = 0;
   await Promise.all(
     urls.map(async (u) => {
-      const geometry = await stl.loadAsync(u);
-      geometry.computeVertexNormals();
-      // main.js installs three-mesh-bvh on the prototype; use it when present so
-      // dragging an arm around raycasts against it cheaply.
-      if (geometry.computeBoundsTree) geometry.computeBoundsTree();
-      geometries.set(u, geometry);
+      meshes.set(u, await loadMesh(u));
       if (onProgress) onProgress(++done, urls.length);
     })
   );
 
-  return new URDFAsset(spec, geometries);
+  return new URDFAsset(spec, meshes);
 }

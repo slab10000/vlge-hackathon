@@ -47,6 +47,22 @@ const UNITS_PER_METER = WORLD_SIZE / DESK_SPAN_METERS;
 // discovered at boot and appended — see lib/asset-library.js.
 const ASSETS = {
   so101: { url: './assets/so101/so101_new_calib.urdf', label: 'SO-101', kind: 'urdf', icon: '🦾' },
+  piper: {
+    url: './assets/piper_x_arm/piper_x_arm.urdf', label: 'Piper-X', kind: 'urdf', icon: '🦿',
+    // Wrist RealSense D405. The URDF has the sensor *housing* frame but no optical
+    // frame — URDF has no camera element — so the optical rotation comes from the
+    // package README (converted from the source MJCF's euler="0 -1.2057 -1.5708").
+    // That is the MuJoCo/OpenGL convention: +X right, +Y up, -Z forward, which is
+    // exactly what a three.js camera expects, so it drops straight in.
+    camera: {
+      link: 'camera',
+      rpy: [1.2057, 0, -1.570796],   // relative to the `camera` link, URDF fixed-axis
+      label: 'RealSense D405 · wrist',
+      fovY: 58,                      // D405 RGB spec is 87° x 58° (H x V)
+      aspect: 848 / 480,             // the stream's own aspect; tune it in the panel
+      near: 0.03, far: 0.6,          // metres — the D405's usable depth range
+    },
+  },
   bottle: { url: './assets/objects/test_bottle.glb', label: 'Bottle', kind: 'glb', icon: '🍶',
             note: 'captured object' },
 };
@@ -290,7 +306,8 @@ gizmo.addEventListener('objectChange', () => {
   syncSizeUI();
 });
 // three r169+ splits the visual helper out of the controls object
-scene.add(gizmo.getHelper ? gizmo.getHelper() : gizmo);
+const gizmoHelper = gizmo.getHelper ? gizmo.getHelper() : gizmo;
+scene.add(gizmoHelper);
 
 const selectionBox = new THREE.BoxHelper(new THREE.Object3D(), 0x7fd4ff);
 selectionBox.visible = false;
@@ -509,7 +526,8 @@ function loadAsset(key, { onProgress } = {}) {
   entry.loading = job
     .then((asset) => {
       entry.asset = asset;
-      const joints = asset.spec?.joints?.filter((j) => j.type !== 'fixed').length;
+      // mimic followers are not a DOF you can command — don't count them
+      const joints = asset.spec?.joints?.filter((j) => j.type !== 'fixed' && !j.mimic).length;
       markAssetReady(key, joints != null
         ? `${joints} joints · URDF`
         : (asset.note || entry.note || entry.kind.toUpperCase()));
@@ -570,6 +588,7 @@ function makeInstance(key) {
   // unscaled extents in the URDF's own metres, so the inspector can talk in cm
   inst.userData = { assetKey: key, robot, isPlaced: true, baseSize: box.getSize(new THREE.Vector3()) };
   inst.add(robot);
+  mountCamera(inst, key);
   return inst;
 }
 
@@ -587,6 +606,7 @@ function addInstance(key, position, yaw = 0) {
   scene.add(inst);
   placed.push(inst);
   select(inst);
+  refreshCameraPanel();
   return inst;
 }
 
@@ -594,9 +614,117 @@ function removeInstance(inst) {
   const i = placed.indexOf(inst);
   if (i >= 0) placed.splice(i, 1);
   if (selection === inst) select(null);
+  unmountCamera(inst);
   scene.remove(inst);
+  refreshCameraPanel();   // the panel may have just lost the lens it was driving
   // geometries and materials belong to the shared URDFAsset — nothing to dispose
 }
+
+// ---------------------------------------------------------------- mounted cameras
+// A robot that carries a camera in its URDF gets a real three.js camera bolted to
+// the same link, so it moves with the arm. Settings live per *asset*, not per
+// instance: they describe one physical sensor, so every Piper-X in the scene sees
+// through the same lens. Tuned in the camera panel, kept across reloads.
+const CAMERA_STORE_KEY = 'deskTwin.cameraSettings';
+const cameraSettings = new Map(); // asset key -> { fovY, aspect, near, far }
+const cameraHelpers = new Map();  // instance -> CameraHelper
+
+function loadCameraSettings() {
+  try {
+    const saved = JSON.parse(storage.get(CAMERA_STORE_KEY) || '{}');
+    for (const [key, v] of Object.entries(saved)) {
+      if (v && ['fovY', 'aspect', 'near', 'far'].every((f) => Number.isFinite(v[f]) && v[f] > 0)) {
+        cameraSettings.set(key, { fovY: v.fovY, aspect: v.aspect, near: v.near, far: v.far });
+      }
+    }
+  } catch (err) {
+    console.warn('ignoring unreadable saved camera settings', err);
+  }
+}
+
+function saveCameraSettings() {
+  storage.set(CAMERA_STORE_KEY, JSON.stringify(Object.fromEntries(cameraSettings)));
+}
+
+/** Spec defaults for `key`, with any saved overrides on top. */
+function cameraConfigOf(key) {
+  const spec = ASSETS[key] && ASSETS[key].camera;
+  if (!spec) return null;
+  const { fovY, aspect, near, far } = spec;
+  return { fovY, aspect, near, far, ...(cameraSettings.get(key) || {}) };
+}
+
+function mountCamera(inst, key) {
+  const spec = ASSETS[key] && ASSETS[key].camera;
+  if (!spec) return;
+  const link = inst.userData.robot && inst.userData.robot.links.get(spec.link);
+  if (!link) {
+    console.warn(`asset "${key}": URDF has no link "${spec.link}" to mount the camera on`);
+    return;
+  }
+  const cam = new THREE.PerspectiveCamera();
+  cam.name = `${inst.name} camera`;
+  // the link is the sensor housing; the optical frame is a fixed rotation off it
+  cam.rotation.set(spec.rpy[0], spec.rpy[1], spec.rpy[2], 'ZYX');
+  link.add(cam);
+  inst.userData.camera = cam;
+
+  const helper = new THREE.CameraHelper(cam);
+  // default colours are a rainbow that shouts over the scene; keep the frustum
+  // edges readable and mute the crosshair/up/target guides
+  helper.setColors?.(
+    new THREE.Color(0x7fd4ff), new THREE.Color(0x2b4b5e), new THREE.Color(0x2b4b5e),
+    new THREE.Color(0x2b4b5e), new THREE.Color(0x2b4b5e)
+  );
+  helper.visible = showFrustum;
+  scene.add(helper);
+  cameraHelpers.set(inst, helper);
+  // configure this one directly: makeInstance runs before the instance joins
+  // `placed`, so the walk in applyCameraConfig would not see it yet
+  applyCameraTo(inst, cameraConfigOf(key));
+}
+
+function unmountCamera(inst) {
+  const helper = cameraHelpers.get(inst);
+  if (helper) {
+    scene.remove(helper);
+    helper.dispose();
+    cameraHelpers.delete(inst);
+  }
+  delete inst.userData.camera;
+}
+
+function applyCameraTo(inst, cfg) {
+  const cam = inst.userData.camera;
+  if (!cam || !cfg) return;
+  cam.fov = cfg.fovY;
+  cam.aspect = cfg.aspect;
+  // near/far are metres: the camera hangs under the instance scale, so its view
+  // space stays in the URDF's own units however the instance is resized
+  cam.near = cfg.near;
+  cam.far = cfg.far;
+  cam.updateProjectionMatrix();
+  const helper = cameraHelpers.get(inst);
+  if (helper) helper.update();
+}
+
+/** Push the asset's current lens settings onto every instance of it. */
+function applyCameraConfig(key) {
+  const cfg = cameraConfigOf(key);
+  if (!cfg) return;
+  for (const inst of placed) {
+    if (inst.userData.assetKey === key) applyCameraTo(inst, cfg);
+  }
+}
+
+/** The instance the camera panel is driving: the selection if it has a lens, else the newest. */
+function activeCameraInstance() {
+  if (selection && selection.userData.camera) return selection;
+  for (let i = placed.length - 1; i >= 0; i--) if (placed[i].userData.camera) return placed[i];
+  return null;
+}
+
+loadCameraSettings();
 
 // ---------------------------------------------------------------- drag preview
 let ghost = null;
@@ -687,6 +815,7 @@ function select(inst) {
     selectionBox.visible = false;
   }
   refreshInspector();
+  refreshCameraPanel();   // the panel follows the selection when it has a lens
 }
 
 // ---------------------------------------------------------------- asset shelf
@@ -961,6 +1090,7 @@ addEventListener('keydown', (e) => {
     case 'KeyS': setMode('scale'); break;
     case 'KeyF': frameSelection(); break;
     case 'KeyP': toggleSimulation(); break;
+    case 'KeyC': toggleCameraPanel(); break;
     case 'Home': frameAll(); break;
     case 'Escape': select(null); break;
     case 'KeyD':
@@ -1126,7 +1256,9 @@ function refreshInspector() {
   head.appendChild(reset);
   jointsBox.appendChild(head);
 
-  for (const [name, j] of robot.joints) {
+  // mimic followers (coupled gripper fingers) move on their own — one slider each
+  // would let you drive them out of sync with the joint they are supposed to track
+  for (const [name, j] of robot.drivenJoints) {
     const row = document.createElement('div');
     row.className = 'joint';
     const label = document.createElement('label');
@@ -1136,25 +1268,184 @@ function refreshInspector() {
     input.type = 'range';
     input.min = String(j.lower);
     input.max = String(j.upper);
-    input.step = '0.005';
+    input.step = String(Math.max((j.upper - j.lower) / 200, 1e-4));
     input.value = String(j.value);
     input.addEventListener('input', () => {
       robot.setJointValue(name, Number(input.value));
-      out.textContent = `${THREE.MathUtils.radToDeg(j.value).toFixed(0)}°`;
+      out.textContent = jointReadout(j);
       selectionBox.update();
     });
-    out.textContent = `${THREE.MathUtils.radToDeg(j.value).toFixed(0)}°`;
+    out.textContent = jointReadout(j);
     row.append(label, out, input);
     jointsBox.appendChild(row);
     jointRows.push({ name, j, input, out });
   }
 }
 
+// revolute joints are radians, prismatic ones are metres — never label mm as degrees
+function jointReadout(j) {
+  return j.type === 'prismatic'
+    ? `${(j.value * 1000).toFixed(0)} mm`
+    : `${THREE.MathUtils.radToDeg(j.value).toFixed(0)}°`;
+}
+
 function syncJointUI() {
   for (const r of jointRows) {
     r.input.value = String(r.j.value);
-    r.out.textContent = `${THREE.MathUtils.radToDeg(r.j.value).toFixed(0)}°`;
+    r.out.textContent = jointReadout(r.j);
   }
+}
+
+// ---------------------------------------------------------------- camera panel
+const camDock = document.getElementById('camdock');
+const camToggleBtn = document.getElementById('camtoggle');
+const camBody = document.getElementById('cambody');
+const camEmpty = document.getElementById('camempty');
+const camLensEl = document.getElementById('camlens');
+const camViewEl = document.getElementById('camview');
+const camFrustumChk = document.getElementById('cam-frustum');
+const camLiveChk = document.getElementById('cam-live');
+const camHFov = document.getElementById('cam-hfov');
+const camVFov = document.getElementById('cam-vfov');
+const camNear = document.getElementById('cam-near');
+const camFar = document.getElementById('cam-far');
+const camAspectOut = document.getElementById('cam-aspect');
+
+let showFrustum = true;
+let panelOpen = false;
+
+const hFovOf = (cfg) =>
+  THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(cfg.fovY) / 2) * cfg.aspect));
+
+/** Aspect that pairs a horizontal and a vertical FOV — the two numbers datasheets quote. */
+const aspectFor = (hFovDeg, vFovDeg) =>
+  Math.tan(THREE.MathUtils.degToRad(hFovDeg) / 2) / Math.tan(THREE.MathUtils.degToRad(vFovDeg) / 2);
+
+function toggleCameraPanel(on) {
+  panelOpen = on === undefined ? !panelOpen : !!on;
+  camDock.hidden = !panelOpen;
+  camToggleBtn.setAttribute('aria-pressed', String(panelOpen));
+  if (panelOpen) refreshCameraPanel();
+}
+
+function refreshCameraPanel() {
+  if (!panelOpen) return;
+  const inst = activeCameraInstance();
+  camBody.hidden = !inst;
+  camEmpty.hidden = !!inst;
+  camViewEl.hidden = !inst || !camLiveChk.checked;
+  if (!inst) return;
+
+  const key = inst.userData.assetKey;
+  const cfg = cameraConfigOf(key);
+  const spec = ASSETS[key].camera;
+  camLensEl.innerHTML = '';
+  camLensEl.append(spec.label || 'camera', ' · ');
+  const who = document.createElement('b');
+  who.textContent = inst.name;              // instance names can carry a filename
+  camLensEl.append(who);
+
+  camVFov.value = cfg.fovY.toFixed(1);
+  camHFov.value = hFovOf(cfg).toFixed(1);
+  camNear.value = (cfg.near * 100).toFixed(1);
+  camFar.value = (cfg.far * 100).toFixed(0);
+  camAspectOut.textContent = cfg.aspect.toFixed(3);
+  camViewEl.style.aspectRatio = String(cfg.aspect);
+  camViewEl.dataset.label = `${hFovOf(cfg).toFixed(0)}° × ${cfg.fovY.toFixed(0)}°`;
+}
+
+function editCamera(patch) {
+  const inst = activeCameraInstance();
+  if (!inst) return;
+  const key = inst.userData.assetKey;
+  cameraSettings.set(key, { ...cameraConfigOf(key), ...patch });
+  saveCameraSettings();
+  applyCameraConfig(key);
+  const cfg = cameraConfigOf(key);
+  camAspectOut.textContent = cfg.aspect.toFixed(3);
+  camViewEl.style.aspectRatio = String(cfg.aspect);
+  camViewEl.dataset.label = `${hFovOf(cfg).toFixed(0)}° × ${cfg.fovY.toFixed(0)}°`;
+}
+
+const numberIn = (el, min, max) => {
+  const v = Number(el.value);
+  return Number.isFinite(v) && v >= min && v <= max ? v : null;
+};
+
+// H and V FOV are edited independently — a datasheet quotes both, and the aspect
+// is whatever makes them agree. Changing one holds the other and moves the aspect.
+camVFov.addEventListener('input', () => {
+  const v = numberIn(camVFov, 1, 179);
+  const h = numberIn(camHFov, 1, 179);
+  if (v === null || h === null) return;
+  editCamera({ fovY: v, aspect: aspectFor(h, v) });
+});
+camHFov.addEventListener('input', () => {
+  const v = numberIn(camVFov, 1, 179);
+  const h = numberIn(camHFov, 1, 179);
+  if (v === null || h === null) return;
+  editCamera({ fovY: v, aspect: aspectFor(h, v) });
+});
+camNear.addEventListener('input', () => {
+  const cm = numberIn(camNear, 0.1, 1e5);
+  const far = numberIn(camFar, 0.1, 1e6);
+  if (cm === null || far === null || cm / 100 >= far / 100) return;
+  editCamera({ near: cm / 100 });
+});
+camFar.addEventListener('input', () => {
+  const cm = numberIn(camFar, 0.2, 1e6);
+  const near = numberIn(camNear, 0.1, 1e5);
+  if (cm === null || near === null || cm <= near) return;
+  editCamera({ far: cm / 100 });
+});
+
+camFrustumChk.addEventListener('change', () => {
+  showFrustum = camFrustumChk.checked;
+  for (const helper of cameraHelpers.values()) helper.visible = showFrustum;
+});
+camLiveChk.addEventListener('change', () => {
+  camViewEl.hidden = !camLiveChk.checked || !activeCameraInstance();
+});
+
+document.getElementById('cam-reset').addEventListener('click', () => {
+  const inst = activeCameraInstance();
+  if (!inst) return;
+  cameraSettings.delete(inst.userData.assetKey);
+  saveCameraSettings();
+  applyCameraConfig(inst.userData.assetKey);
+  refreshCameraPanel();
+});
+
+camToggleBtn.addEventListener('click', () => toggleCameraPanel());
+document.getElementById('camclose').addEventListener('click', () => toggleCameraPanel(false));
+
+// The live view is a second pass over the same scene through the mounted lens.
+// Editor furniture is not part of the world the sensor sees, so it blinks off.
+function renderCameraPreview() {
+  if (!panelOpen || !camLiveChk.checked) return;
+  const inst = activeCameraInstance();
+  const cam = inst && inst.userData.camera;
+  if (!cam) return;
+
+  const rect = camViewEl.getBoundingClientRect();
+  const canvasRect = renderer.domElement.getBoundingClientRect();
+  if (rect.width < 8 || rect.height < 8) return;
+
+  const overlays = [gizmoHelper, selectionBox, grid, ghost, ...cameraHelpers.values()];
+  const wasVisible = overlays.map((o) => o && o.visible);
+  for (const o of overlays) if (o) o.visible = false;
+
+  const x = rect.left - canvasRect.left;
+  const y = canvasRect.bottom - rect.bottom;   // WebGL counts from the bottom
+  renderer.setScissorTest(true);
+  renderer.setViewport(x, y, rect.width, rect.height);
+  renderer.setScissor(x, y, rect.width, rect.height);
+  renderer.render(scene, cam);
+  renderer.setScissorTest(false);
+  const v = viewportSize();
+  renderer.setViewport(0, 0, v.w, v.h);
+
+  overlays.forEach((o, i) => { if (o) o.visible = wasVisible[i]; });
 }
 
 // ---------------------------------------------------------------- loop
@@ -1165,6 +1456,7 @@ function animate() {
   stepPhysics();
   if (selection) selectionBox.setFromObject(selection);
   renderer.render(scene, camera);
+  renderCameraPreview();
 }
 animate();
 
@@ -1186,5 +1478,7 @@ window.__editor = {
   THREE, scene, camera, controls, gizmo, placed, ASSETS,
   addInstance, removeInstance, select, frameAll, frameSelection, dropToSurface, syncJointUI,
   defaultScaleOf, saveDefaultScales, heightOf,
+  cameraSettings, cameraHelpers, cameraConfigOf, applyCameraConfig, activeCameraInstance,
+  toggleCameraPanel, refreshCameraPanel, hFovOf,
   get selection() { return selection; },
 };
