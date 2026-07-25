@@ -116,6 +116,25 @@
   #simulate:disabled { opacity: .5; cursor: not-allowed; }
   #simulate kbd { font: inherit; color: var(--dim); }
 
+  /* ------------------------------------------------------------- live stream */
+  #live { margin-top: 10px; border-top: 1px solid var(--edge); padding-top: 8px; }
+  #live-dot { width: 8px; height: 8px; border-radius: 50%; background: #55606c; }
+  #live-dot[data-state="connecting"], #live-dot[data-state="waiting"],
+  #live-dot[data-state="retry"] { background: #ffb454; }
+  #live-dot[data-state="live"] { background: #6ee7a0; }
+  .liverow { display: flex; gap: 6px; }
+  .liverow input {
+    flex: 1; min-width: 0; padding: 5px 7px; border-radius: 6px; color: var(--ink);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+    font: 500 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .liverow button {
+    padding: 5px 9px; border-radius: 6px; cursor: pointer;
+    font: 500 11px -apple-system, system-ui, sans-serif; color: var(--ink);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+  }
+  .liverow button:hover { background: rgba(255,255,255,0.12); }
+
   /* --------------------------------------------------------------- inspector */
   /* saved layouts, under the title on the left */
   #presets { top: 62px; left: 16px; width: 224px; padding: 12px; }
@@ -234,6 +253,14 @@
   <p class="hint">Drag onto the scene to place, or click to drop one in front of the camera.</p>
   <p class="hint" id="libnote">Drop <b>.glb</b> / <b>.ply</b> files into <code>assets/library/</code> — or drag one straight onto the view.</p>
   <button id="simulate" type="button" aria-pressed="false">▶ Simulate physics <kbd>P</kbd></button>
+  <div id="live">
+    <div class="jhead"><span>Live robot</span><span id="live-dot" data-state="idle"></span></div>
+    <div class="liverow">
+      <input id="live-url" type="text" placeholder="ws://robot-laptop:8765" spellcheck="false" autocomplete="off">
+      <button id="live-connect" type="button">Connect</button>
+    </div>
+    <p class="hint" id="live-note"></p>
+  </div>
 </div>
 
 <div id="inspector" class="card" hidden>
@@ -276,7 +303,7 @@
 
 <div id="overlay">
   <h1>Desk Twin</h1>
-  <div class="sub">A digital twin of our hackathon desk, captured with one phone video and rebuilt in the browser. Drop SO-101 arms into it and pose them.</div>
+  <div class="sub">A digital twin of our hackathon desk, captured with one phone video and rebuilt in the browser. Drop SO-101 / Piper arms into it, pose them — or mirror the real arm live.</div>
   <div id="loadbar"><div></div></div>
   <div id="loadnote">loading desk scan…</div>
 </div>

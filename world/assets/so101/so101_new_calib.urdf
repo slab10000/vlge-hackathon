@@ -11,10 +11,10 @@
     <color rgba="0.1 0.1 0.1 1.0"/>
   </material>
   <material name="camera_mount">
-    <color rgba="0.3 0.3 0.3 1.0"/>
+    <color rgba="0.95 0.95 0.95 1.0"/>
   </material>
   <material name="camera_body">
-    <color rgba="0.05 0.05 0.05 1.0"/>
+    <color rgba="0.9 0.35 0.1 1.0"/>
   </material>
 
   <!-- Link base -->
@@ -312,11 +312,18 @@
     <axis xyz="0 0 0"/>
   </joint>
 
-  <!-- Camera mount base (dummy link + fixed joint + simple box bracket visual). Mounted
-       on gripper_link, at the same origin as its "Visual Geometry 2" (the
-       sts3215_03a_v1_5 motor-housing mesh): confirmed against URDF Studio by the
-       physical camera mount location. This is where the mount BOLTS ON, not where the
-       lens looks from: see camera_link below for that. -->
+  <!-- Camera mount base (dummy link + fixed joint + simple box bracket visual). The real
+       bracket bolts onto gripper_link's "Visual Geometry 2" (the sts3215_03a_v1
+       motor-housing mesh). NOTE: that mesh's URDF-Studio origin (0.0077 0.0001 -0.0234,
+       roll -90) is the STL's own placement transform, which sits at the servo's CENTRE,
+       so using it verbatim buries the mount inside the housing. The y here is pushed out
+       to the housing's outer face instead (mesh half-height 0.0202 along gripper_link +y).
+       This is where the mount BOLTS ON, not where the lens looks from: see camera_link.
+       KNOWN WRONG, still a placeholder: +y puts the bracket inside moving_jaw_so101_v1 at
+       every gripper angle. Which face it should be is NOT yet established: the real bracket
+       is L-shaped and routes around the wrist, so no face admits a straight stub. Place it
+       with debug/12_so101_viser.py's drag gizmo, then run debug/17_so101_camera_check.py
+       (which currently FAILS on this placeholder, as it should). -->
   <link name="camera_mount_base_link">
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -333,7 +340,7 @@
   </link>
 
   <joint name="camera_mount_base_joint" type="fixed">
-    <origin xyz="0.0077 0.0001 -0.0234" rpy="-1.5708 0 0"/>
+    <origin xyz="0.0077 0.0203 -0.0234" rpy="-1.5708 0 0"/>
     <parent link="gripper_link"/>
     <child link="camera_mount_base_link"/>
     <axis xyz="0 0 0"/>
@@ -344,7 +351,11 @@
        actual measurement frame used everywhere in code (SoArmKinematics.CAMERA_FRAME,
        scripts/zmq_so_arm_handler.py's camera_pos_world/eef_pos_camera fields). Sign/magnitude
        of the 0.015 offset is a first guess: flip to -0.015 if viser shows it looking the
-       wrong way once you check it against the real mount. -->
+       wrong way once you check it against the real mount.
+       The roll of -90 makes this a standard OpenCV / REP-104 optical frame: +z along the
+       lens, +x right, +y down. Do not "simplify" it away. eef_pos_camera is only comparable
+       across embodiments if every robot's URDF uses this same convention, and a wrong one
+       yields plausible numbers rather than an error. -->
   <link name="camera_link">
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -361,7 +372,7 @@
   </link>
 
   <joint name="camera_joint" type="fixed">
-    <origin xyz="0 0 0.015" rpy="0 0 0"/>
+    <origin xyz="0 0 0.015" rpy="-1.5708 0 0"/>
     <parent link="camera_mount_base_link"/>
     <child link="camera_link"/>
     <axis xyz="0 0 0"/>
