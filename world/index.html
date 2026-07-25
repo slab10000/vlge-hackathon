@@ -117,6 +117,37 @@
   #simulate kbd { font: inherit; color: var(--dim); }
 
   /* --------------------------------------------------------------- inspector */
+  /* saved layouts, under the title on the left */
+  #presets { top: 62px; left: 16px; width: 224px; padding: 12px; }
+  #presets .row { margin-bottom: 0; }
+  #preset-name {
+    flex: 1; min-width: 0; padding: 5px 7px; border-radius: 6px; font: inherit; font-size: 11px;
+    color: var(--ink); background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+  }
+  #preset-name:focus { outline: none; border-color: rgba(127,212,255,0.5); }
+  #preset-save { flex: none; padding: 5px 10px; }
+  #preset-list { margin-top: 8px; max-height: min(38vh, 300px); overflow-y: auto; overscroll-behavior: contain; }
+  #preset-list::-webkit-scrollbar { width: 6px; }
+  #preset-list .hint { margin: 2px 0 0; }
+  .preset { display: flex; gap: 4px; align-items: stretch; margin-bottom: 4px; }
+  .preset-open {
+    flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; text-align: left;
+    padding: 6px 8px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px;
+    color: var(--ink); background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+  }
+  .preset-open:hover { background: rgba(127,212,255,0.18); border-color: rgba(127,212,255,0.5); }
+  .preset-open .pname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .preset-open em { margin-left: auto; flex: none; font-style: normal; font-size: 10px; color: var(--dim); }
+  .preset-del {
+    flex: none; width: 26px; border-radius: 6px; cursor: pointer; font: inherit; line-height: 1;
+    color: var(--dim); background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+  }
+  .preset-del:hover { background: rgba(255,110,110,0.22); border-color: rgba(255,110,110,0.5); color: #fff; }
+  #presets button:disabled, #preset-name:disabled { opacity: .5; cursor: progress; }
+  #preset-note { margin: 8px 0 0; min-height: 1em; }
+  #preset-note[data-tone="ok"] { color: var(--accent); }
+  #preset-note[data-tone="warn"] { color: #ffb4b4; }
+
   #inspector { right: 16px; bottom: 16px; width: 250px; padding: 12px; }
   #inspector[hidden] { display: none; }
   #inspector h2 {
@@ -187,6 +218,16 @@
 
 <div id="scenarios"></div>
 
+<div id="presets" class="card">
+  <h2>Layouts</h2>
+  <div class="row">
+    <input id="preset-name" type="text" placeholder="Name this layout" maxlength="40" autocomplete="off">
+    <button id="preset-save" type="button" title="Save what is placed right now">Save</button>
+  </div>
+  <div id="preset-list"></div>
+  <p class="hint" id="preset-note"></p>
+</div>
+
 <div id="shelf" class="card">
   <h2>Assets <button id="rescan" type="button" title="Re-read world/assets/library/">Rescan</button></h2>
   <div id="shelf-items"></div>
@@ -249,6 +290,6 @@
   }
 }
 </script>
-<script type="module" src="./main.js?v=24"></script>
+<script type="module" src="./main.js?v=27"></script>
 </body>
 </html>

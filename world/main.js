@@ -6,6 +6,7 @@ import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-
 import { EditorControls } from './lib/editor-controls.js';
 import { loadURDF } from './lib/urdf-loader.js';
 import { scanLibrary, loadLibraryAsset, LIBRARY_URL } from './lib/asset-library.js';
+import * as presets from './lib/presets.js';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -415,6 +416,7 @@ function loadScenario(scenario, { frame = true } = {}) {
         storage.set('scenario', scenario.id);
         titleName.textContent = scenario.name;
         updateScenarioButtons();
+        refreshPresetList();          // presets are per scenario
         if (frame) controls.frame(box, { yaw: 0.6, pitch: -0.5 });
         respawnProps();
         if (!bootstrapped) { bootstrapped = true; worldReady(); }
@@ -597,6 +599,183 @@ function removeInstance(inst) {
   scene.remove(inst);
   // geometries and materials belong to the shared URDFAsset — nothing to dispose
 }
+
+// ---------------------------------------------------------------- scene presets
+// Save/restore what is placed in the current scenario: which assets, where, how
+// big, and how the articulated ones are posed. See lib/presets.js for storage.
+
+/** Serializable snapshot of everything currently placed. */
+function capturePlacement() {
+  return placed.map((inst) => {
+    const key = inst.userData.assetKey;
+    const robot = inst.userData.robot;
+    const out = {
+      key,
+      // filename lets a preset re-link to the same model after a dragged-in file
+      // is copied into assets/library/ (its session key is gone, the file isn't)
+      file: ASSETS[key]?.file || null,
+      name: inst.name,
+      pos: inst.position.toArray(),
+      quat: inst.quaternion.toArray(),
+      scale: inst.scale.toArray(),
+    };
+    if (robot?.joints?.size) {
+      out.joints = Object.fromEntries([...robot.joints].map(([n, j]) => [n, j.value]));
+    }
+    return out;
+  });
+}
+
+/** The live asset key for a stored object, re-linking by filename if needed. */
+function resolveAssetKey(saved) {
+  if (saved.key && ASSETS[saved.key]) return saved.key;
+  if (!saved.file) return null;
+  return Object.keys(ASSETS).find((k) => ASSETS[k].file === saved.file) || null;
+}
+
+/** Replace everything placed with `objects`. Returns how many could not load. */
+async function applyPlacement(objects) {
+  if (simulating) stopSimulation();
+  for (const inst of [...placed]) removeInstance(inst);
+
+  let missing = 0;
+  for (const saved of objects) {
+    const key = resolveAssetKey(saved);
+    if (!key) { missing++; continue; }
+    let inst = null;
+    try {
+      await loadAsset(key);          // no-op once the asset is cached
+      inst = makeInstance(key);
+    } catch { /* falls through to the missing count */ }
+    if (!inst) { missing++; continue; }
+
+    inst.position.fromArray(saved.pos);
+    if (saved.quat) inst.quaternion.fromArray(saved.quat);
+    if (saved.scale) inst.scale.fromArray(saved.scale);
+    if (saved.name) inst.name = saved.name;
+    const robot = inst.userData.robot;
+    if (saved.joints && robot?.setJointValue) {
+      for (const [n, v] of Object.entries(saved.joints)) robot.setJointValue(n, v);
+    }
+    scene.add(inst);
+    placed.push(inst);
+  }
+  select(null);
+  return missing;
+}
+
+// ---- preset panel UI
+const presetPanel = document.getElementById('presets');
+const presetList = document.getElementById('preset-list');
+const presetName = document.getElementById('preset-name');
+const presetSave = document.getElementById('preset-save');
+const presetNote = document.getElementById('preset-note');
+let presetBusy = false;
+
+function setPresetNote(text, tone = '') {
+  if (!presetNote) return;
+  presetNote.textContent = text;
+  presetNote.dataset.tone = tone;
+}
+
+// Opening is async (assets may still be downloading) and it empties the scene
+// before refilling it — so saving mid-open would capture a half-built layout.
+function setPresetBusy(busy) {
+  presetBusy = busy;
+  if (presetSave) presetSave.disabled = busy;
+  if (presetName) presetName.disabled = busy;
+  for (const b of presetList?.querySelectorAll('button') || []) b.disabled = busy;
+}
+
+function refreshPresetList() {
+  if (!presetList) return;
+  const id = activeScenario?.id;
+  presetList.replaceChildren();
+  const saved = id ? presets.listPresets(id) : [];
+
+  if (!saved.length) {
+    const empty = document.createElement('p');
+    empty.className = 'hint';
+    empty.textContent = id
+      ? 'No saved layouts for this scene yet.'
+      : 'Waiting for a scene…';
+    presetList.appendChild(empty);
+    return;
+  }
+
+  for (const item of saved) {
+    const row = document.createElement('div');
+    row.className = 'preset';
+
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'preset-open';
+    open.title = `Open "${item.name}"`;
+    open.innerHTML = `<span class="pname"></span><em>${item.count} object${item.count === 1 ? '' : 's'}</em>`;
+    open.querySelector('.pname').textContent = item.name;
+    open.addEventListener('click', () => openPreset(item.name));
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'preset-del';
+    del.title = `Delete "${item.name}"`;
+    del.textContent = '×';
+    del.addEventListener('click', () => {
+      // saved layouts have no undo, and the × sits next to the open button
+      if (!confirm(`Delete the layout "${item.name}"?`)) return;
+      presets.deletePreset(activeScenario.id, item.name);
+      refreshPresetList();
+      setPresetNote(`deleted "${item.name}"`);
+    });
+
+    row.append(open, del);
+    presetList.appendChild(row);
+  }
+  // a scenario swap can rebuild this list mid-open — keep the lock visible
+  if (presetBusy) for (const b of presetList.querySelectorAll('button')) b.disabled = true;
+}
+
+function saveCurrentPreset() {
+  if (!activeScenario || presetBusy) return;
+  const name = presets.cleanName(presetName.value || `Layout ${presets.listPresets(activeScenario.id).length + 1}`);
+  if (!name) { setPresetNote('give it a name first', 'warn'); presetName.focus(); return; }
+  if (presets.hasPreset(activeScenario.id, name)
+      && !confirm(`"${name}" already exists in ${activeScenario.name}. Overwrite it?`)) return;
+
+  const res = presets.savePreset(activeScenario.id, name, capturePlacement());
+  if (!res.ok) { setPresetNote(res.error, 'warn'); return; }
+  presetName.value = '';
+  refreshPresetList();
+  setPresetNote(`saved "${name}" · ${placed.length} object${placed.length === 1 ? '' : 's'}`, 'ok');
+}
+
+async function openPreset(name) {
+  if (presetBusy || !activeScenario) return;
+  const objects = presets.readPreset(activeScenario.id, name);
+  if (!objects) { setPresetNote(`"${name}" is gone`, 'warn'); refreshPresetList(); return; }
+
+  setPresetBusy(true);
+  setPresetNote(`opening "${name}"…`);
+  try {
+    const missing = await applyPlacement(objects);
+    setPresetNote(
+      missing
+        ? `opened "${name}" · ${objects.length - missing}/${objects.length} restored — ${missing} asset${missing === 1 ? '' : 's'} unavailable`
+        : `opened "${name}" · ${objects.length} object${objects.length === 1 ? '' : 's'}`,
+      missing ? 'warn' : 'ok');
+  } catch (err) {
+    console.error('preset failed to open', err);
+    setPresetNote(`could not open "${name}"`, 'warn');
+  } finally {
+    setPresetBusy(false);
+  }
+}
+
+presetSave?.addEventListener('click', saveCurrentPreset);
+presetName?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); saveCurrentPreset(); }
+});
+refreshPresetList();
 
 // ---------------------------------------------------------------- drag preview
 let ghost = null;
