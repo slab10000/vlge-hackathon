@@ -1,0 +1,5 @@
+wrist_roll:
+  zero_ticks: 3072
+gripper:
+  closed_ticks: 2049
+  open_ticks: 3514
