@@ -13,6 +13,7 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
 const SCENARIOS = [
   { id: 'desk',   name: 'Desk',        url: './assets/desk.glb' },
   { id: 'snacks', name: 'Snack Table', url: './assets/snacks.glb' },
+  { id: 'laptop', name: 'Laptop Desk', url: './assets/laptop.glb' },
 ];
 const WORLD_SIZE = 16;     // normalize largest scene dimension to this many meters (big = desk becomes terrain)
 // If the scan comes out tilted, correct it here (radians), applied X then Y then Z.
