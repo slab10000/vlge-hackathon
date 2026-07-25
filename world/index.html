@@ -24,7 +24,12 @@
     user-select: none;
   }
 
-  #title { top: 16px; left: 16px; padding: 8px 14px; font-weight: 600; font-size: 14px; pointer-events: none; }
+  /* keep clear of the centred scenario picker on narrow viewports */
+  #title {
+    top: 16px; left: 16px; padding: 8px 14px; font-weight: 600; font-size: 14px;
+    pointer-events: none; max-width: calc(50vw - 150px);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   #title span { color: var(--dim); font-weight: 400; }
   #title #titlename { color: var(--ink); font-weight: 600; }
 
@@ -144,7 +149,7 @@
 <body>
 <div id="app"></div>
 
-<div id="title" class="card"><span id="titlename">Desk</span> Twin <span>· scanned with a phone · reconstructed on-device · SO-101 lives here</span></div>
+<div id="title" class="card"><span id="titlename">Desk</span> Twin <span>· phone-scanned · rebuilt on-device</span></div>
 
 <div id="scenarios"></div>
 
@@ -195,6 +200,6 @@
   }
 }
 </script>
-<script type="module" src="./main.js?v=13"></script>
+<script type="module" src="./main.js?v=21"></script>
 </body>
 </html>

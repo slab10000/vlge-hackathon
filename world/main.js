@@ -10,6 +10,16 @@ THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
+// Optional physics engine (Rapier, WASM). The editor is fully usable without it —
+// only the Simulate toggle goes dark — so never let a CDN hiccup break the app.
+let RAPIER = null;
+try {
+  RAPIER = (await import('https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/+esm')).default;
+  await RAPIER.init();
+} catch (err) {
+  console.warn('Rapier unavailable — physics simulation disabled:', err);
+}
+
 // ---------------------------------------------------------------- config
 // Scenario registry — each entry is a scanned scene you can hot-swap to
 // (picker buttons top-right, or number keys 1..9). Last choice persists.
