@@ -5,51 +5,152 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Desk Twin — VLGE Hackathon</title>
 <style>
+  :root {
+    --bg: rgba(10, 14, 20, 0.78);
+    --edge: rgba(255, 255, 255, 0.12);
+    --ink: #e8edf2;
+    --dim: #9aa7b4;
+    --accent: #7fd4ff;
+  }
   html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e12; }
   #app { position: fixed; inset: 0; }
-  #hud {
-    position: fixed; left: 16px; bottom: 16px; z-index: 10;
-    color: #e8edf2; font: 13px/1.5 -apple-system, system-ui, sans-serif;
-    background: rgba(10, 14, 20, 0.72); border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 10px; padding: 10px 14px; backdrop-filter: blur(6px);
-    user-select: none; pointer-events: none;
+  #app canvas { display: block; touch-action: none; }
+
+  .card {
+    position: fixed; z-index: 10; color: var(--ink);
+    font: 13px/1.5 -apple-system, system-ui, sans-serif;
+    background: var(--bg); border: 1px solid var(--edge);
+    border-radius: 10px; backdrop-filter: blur(6px);
+    user-select: none;
   }
-  #hud b { color: #7fd4ff; }
-  #title {
-    position: fixed; top: 16px; left: 16px; z-index: 10;
-    color: #e8edf2; font: 600 14px -apple-system, system-ui, sans-serif;
-    background: rgba(10, 14, 20, 0.72); border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 10px; padding: 8px 14px; backdrop-filter: blur(6px);
-    user-select: none; pointer-events: none;
+
+  #title { top: 16px; left: 16px; padding: 8px 14px; font-weight: 600; font-size: 14px; pointer-events: none; }
+  #title span { color: var(--dim); font-weight: 400; }
+
+  #hud { left: 16px; bottom: 16px; padding: 10px 14px; pointer-events: none; }
+  #hud b { color: var(--accent); font-weight: 600; }
+  #hud div + div { margin-top: 2px; }
+  #hud .sep { color: rgba(255,255,255,0.25); }
+
+  /* ------------------------------------------------------------- asset shelf */
+  #shelf { top: 16px; right: 16px; width: 224px; padding: 12px; }
+  #shelf h2 {
+    margin: 0 0 8px; font-size: 11px; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--dim); font-weight: 600;
   }
-  #title span { color: #9aa7b4; font-weight: 400; }
+  .asset {
+    display: flex; gap: 10px; align-items: center; width: 100%;
+    padding: 8px; border-radius: 8px; cursor: grab;
+    background: rgba(255,255,255,0.05); border: 1px solid transparent;
+    transition: background .15s, border-color .15s;
+  }
+  .asset:hover { background: rgba(127,212,255,0.12); border-color: rgba(127,212,255,0.35); }
+  .asset:active { cursor: grabbing; }
+  .asset[aria-disabled="true"] { opacity: .5; cursor: progress; }
+  .asset .thumb {
+    width: 38px; height: 38px; flex: none; border-radius: 6px; font-size: 20px;
+    display: grid; place-items: center; background: rgba(127,212,255,0.14);
+  }
+  .asset .meta { min-width: 0; }
+  .asset .meta b { display: block; font-size: 13px; }
+  .asset .meta span { color: var(--dim); font-size: 11px; }
+  #shelf .hint { margin: 8px 2px 0; color: var(--dim); font-size: 11px; line-height: 1.45; }
+
+  /* --------------------------------------------------------------- inspector */
+  #inspector { right: 16px; bottom: 16px; width: 250px; padding: 12px; }
+  #inspector[hidden] { display: none; }
+  #inspector h2 {
+    margin: 0 0 8px; font-size: 13px; font-weight: 600;
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  #inspector h2 em { font-style: normal; color: var(--dim); font-size: 11px; }
+  .row { display: flex; gap: 6px; margin-bottom: 6px; }
+  .row button {
+    flex: 1; padding: 6px 4px; border-radius: 6px; cursor: pointer;
+    font: 500 11px -apple-system, system-ui, sans-serif; color: var(--ink);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+  }
+  .row button:hover { background: rgba(255,255,255,0.12); }
+  .row button[aria-pressed="true"] { background: rgba(127,212,255,0.22); border-color: rgba(127,212,255,0.5); color: #fff; }
+  .row button kbd { font: inherit; color: var(--dim); }
+  .row button.danger:hover { background: rgba(255,110,110,0.22); border-color: rgba(255,110,110,0.5); }
+
+  #joints { margin-top: 10px; border-top: 1px solid var(--edge); padding-top: 8px; }
+  #joints .jhead {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--dim); font-weight: 600; margin-bottom: 6px;
+  }
+  #joints .jhead button {
+    padding: 3px 8px; border-radius: 5px; cursor: pointer; text-transform: none; letter-spacing: 0;
+    font: 500 11px -apple-system, system-ui, sans-serif; color: var(--ink);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+  }
+  .joint { display: grid; grid-template-columns: 1fr auto; gap: 0 6px; margin-bottom: 5px; font-size: 11px; }
+  .joint label { color: var(--dim); }
+  .joint output { font-variant-numeric: tabular-nums; color: var(--accent); }
+  .joint input { grid-column: 1 / -1; width: 100%; margin: 0; accent-color: var(--accent); height: 14px; }
+
+  /* ----------------------------------------------------------------- overlay */
   #overlay {
     position: fixed; inset: 0; z-index: 20; display: flex;
     align-items: center; justify-content: center; flex-direction: column; gap: 12px;
-    background: rgba(5, 8, 12, 0.82); color: #e8edf2; cursor: pointer;
+    background: rgba(5, 8, 12, 0.9); color: var(--ink);
     font: 15px -apple-system, system-ui, sans-serif; text-align: center;
+    transition: opacity .35s;
   }
   #overlay h1 { font-size: 22px; margin: 0; }
-  #overlay .sub { color: #9aa7b4; max-width: 420px; }
+  #overlay .sub { color: var(--dim); max-width: 430px; line-height: 1.5; }
   #loadbar { width: 260px; height: 6px; border-radius: 3px; background: rgba(255,255,255,0.12); overflow: hidden; }
-  #loadbar div { height: 100%; width: 0%; background: #7fd4ff; transition: width .2s; }
-  #cross {
-    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    z-index: 5; color: rgba(255,255,255,0.65); font: 18px monospace; pointer-events: none;
-  }
+  #loadbar div { height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
+  #loadnote { color: var(--dim); font-size: 12px; min-height: 1.2em; }
 </style>
 </head>
 <body>
 <div id="app"></div>
-<div id="title">Desk Twin <span>· scanned with a phone · reconstructed on-device · SO-101 lives here</span></div>
-<div id="cross">+</div>
-<div id="hud"><b>WASD</b>/<b>arrows</b> move · <b>mouse</b> look · <b>Space</b> jump · <b>E</b> grab/throw · <b>R</b> reset · <b>Esc</b> release cursor</div>
+
+<div id="title" class="card">Desk Twin <span>· scanned with a phone · reconstructed on-device · SO-101 lives here</span></div>
+
+<div id="shelf" class="card">
+  <h2>Assets</h2>
+  <div class="asset" id="asset-so101" draggable="false" aria-disabled="true" title="SO-101 arm (URDF)">
+    <div class="thumb">🦾</div>
+    <div class="meta"><b>SO-101</b><span id="asset-so101-status">loading meshes…</span></div>
+  </div>
+  <p class="hint">Drag onto the scene to place, or click to drop one in front of the camera.</p>
+</div>
+
+<div id="inspector" class="card" hidden>
+  <h2><span id="insp-name">—</span><em id="insp-hint">click empty space to deselect</em></h2>
+  <div class="row" id="insp-modes">
+    <button data-mode="translate" aria-pressed="true">Move <kbd>G</kbd></button>
+    <button data-mode="rotate" aria-pressed="false">Rotate <kbd>R</kbd></button>
+    <button data-mode="scale" aria-pressed="false">Scale <kbd>S</kbd></button>
+  </div>
+  <div class="row">
+    <button id="insp-drop">Drop to surface</button>
+    <button id="insp-dup">Duplicate <kbd>⇧D</kbd></button>
+  </div>
+  <div class="row">
+    <button id="insp-focus">Frame <kbd>F</kbd></button>
+    <button id="insp-del" class="danger">Delete <kbd>X</kbd></button>
+  </div>
+  <div id="joints"></div>
+</div>
+
+<div id="hud" class="card">
+  <div><b>MMB</b> or <b>⌥+drag</b> orbit <span class="sep">·</span> <b>⇧+drag</b> pan <span class="sep">·</span> <b>scroll</b> zoom</div>
+  <div><b>RMB</b> look around <span class="sep">·</span> <b>WASD/QE</b> fly while holding RMB <span class="sep">·</span> <b>⇧</b> faster</div>
+  <div><b>drag an object</b> to slide it along the surface <span class="sep">·</span> <b>G/R/S</b> gizmo <span class="sep">·</span> <b>F</b> frame <span class="sep">·</span> <b>Home</b> frame all</div>
+</div>
+
 <div id="overlay">
   <h1>Desk Twin</h1>
-  <div class="sub">A digital twin of our hackathon desk, captured with one phone video and rebuilt as a walkable world with collision.</div>
+  <div class="sub">A digital twin of our hackathon desk, captured with one phone video and rebuilt in the browser. Drop SO-101 arms into it and pose them.</div>
   <div id="loadbar"><div></div></div>
-  <div id="clicktip" style="display:none">Click to enter</div>
+  <div id="loadnote">loading desk scan…</div>
 </div>
+
 <script type="importmap">
 {
   "imports": {
@@ -59,6 +160,6 @@
   }
 }
 </script>
-<script type="module" src="./main.js?v=18"></script>
+<script type="module" src="./main.js?v=13"></script>
 </body>
 </html>

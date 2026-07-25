@@ -1,59 +1,56 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+import { EditorControls } from './lib/editor-controls.js';
+import { loadURDF } from './lib/urdf-loader.js';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
-// optional physics engine (Rapier, WASM) for draggable props — world still works without it
-let RAPIER = null;
-try {
-  RAPIER = (await import('https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/+esm')).default;
-  await RAPIER.init();
-} catch (err) {
-  console.warn('Rapier unavailable — draggable props disabled:', err);
-}
-
 // ---------------------------------------------------------------- config
 const MODEL_URL = './assets/desk.glb';
-const WORLD_SIZE = 16;     // normalize largest scene dimension to this many meters (big = desk becomes terrain)
-// Longest real-world dimension of the scanned scene, in meters. The scan itself
-// has no metric scale, so this is what converts captured objects (which ARE
-// metric, via tools/make_object.py) into this deliberately scaled-up world.
-const REAL_SCENE_SIZE_M = 1.6;
-const METERS_TO_WORLD = WORLD_SIZE / REAL_SCENE_SIZE_M;
-
-// Real objects captured with tools/make_object.py. Drop a name in here after
-// running the pipeline and it becomes a grabbable, physics-driven prop.
-const OBJECT_PROPS = [
-  // synthetic placeholder proving the pipeline — replace with a real capture
-  { name: 'test_bottle', url: './assets/objects/test_bottle.glb' },
-];
+const WORLD_SIZE = 16;     // normalize largest scene dimension to this many world units
 // If the scan comes out tilted, correct it here (radians), applied X then Y then Z.
 const WORLD_ROTATION = new THREE.Euler(0, 0, 0);
 
-const GRAVITY = -18;
-const PLAYER_SPEED = 4.5;
-const JUMP_VELOCITY = 6.5;
-const CAPSULE_RADIUS = 0.28;
-const CAPSULE_HEIGHT = 1.55; // total height incl. caps
+// The scan is normalized to WORLD_SIZE units, so world units are not metres.
+// URDFs are in metres — measure the longest dimension of the real desk and put it
+// here, and every URDF asset lands at true physical scale relative to the scan.
+const DESK_SPAN_METERS = 1.6;
+const UNITS_PER_METER = WORLD_SIZE / DESK_SPAN_METERS;
+
+const ASSETS = {
+  so101: { url: './assets/so101/so101_new_calib.urdf', label: 'SO-101' },
+};
 
 // ---------------------------------------------------------------- scene
 const container = document.getElementById('app');
+
+// Measure the container, not the window: embedded panes can report innerWidth 0,
+// which would poison the camera aspect with NaN and render nothing forever.
+function viewportSize() {
+  const w = container.clientWidth || innerWidth || document.documentElement.clientWidth;
+  const h = container.clientHeight || innerHeight || document.documentElement.clientHeight;
+  return { w: Math.max(1, w || 1), h: Math.max(1, h || 1) };
+}
+const view = viewportSize();
+
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.setSize(innerWidth, innerHeight);
+renderer.setSize(view.w, view.h);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 container.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x10151c);
-scene.fog = new THREE.Fog(0x10151c, WORLD_SIZE * 1.5, WORLD_SIZE * 5);
+// fog only swallows the far edge of the grid — the editor camera can pull way back
+scene.fog = new THREE.Fog(0x10151c, WORLD_SIZE * 4, WORLD_SIZE * 12);
 
-const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.05, 200);
+const camera = new THREE.PerspectiveCamera(55, view.w / view.h, 0.02, 2000);
 
 const hemi = new THREE.HemisphereLight(0xcfe6ff, 0x3a3228, 1.1);
 scene.add(hemi);
@@ -62,12 +59,13 @@ sun.position.set(4, 8, 3);
 scene.add(sun);
 scene.add(new THREE.AmbientLight(0xffffff, 0.35));
 
-// subtle grid "void floor" far below as a safety net visual
 const grid = new THREE.GridHelper(WORLD_SIZE * 8, 64, 0x2b3946, 0x1a232d);
 grid.position.y = -0.01;
 scene.add(grid);
 
-// ---------------------------------------------------------------- collider assembly
+// ---------------------------------------------------------------- pick surface
+// One merged BVH mesh of everything you can drop something onto. Invisible, but
+// the raycaster still sees it (three only filters by layers, not visibility).
 const colliderGeometries = [];
 
 function addColliderGeometry(mesh) {
@@ -76,11 +74,10 @@ function addColliderGeometry(mesh) {
   for (const name of Object.keys(geom.attributes)) {
     if (name !== 'position') geom.deleteAttribute(name);
   }
-  const flat = geom.index ? geom.toNonIndexed() : geom;
-  colliderGeometries.push(flat);
+  colliderGeometries.push(geom.index ? geom.toNonIndexed() : geom);
 }
 
-// safety ground plane so you can never fall out of the world
+// ground plane, so a drop always lands somewhere even off the edge of the scan
 {
   const ground = new THREE.Mesh(new THREE.BoxGeometry(WORLD_SIZE * 8, 0.2, WORLD_SIZE * 8));
   ground.position.y = -0.1;
@@ -94,175 +91,36 @@ function buildCollider() {
   merged.computeBoundsTree();
   collider = new THREE.Mesh(merged);
   collider.visible = false;
+  collider.name = 'pick-surface';
   scene.add(collider);
-  initPhysics();
 }
 
-// ---------------------------------------------------------------- props physics (Rapier)
-let phys = null;
-let playerBody = null;
-let physReady = false;
-const props = []; // {mesh, body, home}
-window.__props = props; // debug handle
+// ---------------------------------------------------------------- editor camera
+const controls = new EditorControls(camera, renderer.domElement, {
+  minDistance: 0.15,
+  maxDistance: WORLD_SIZE * 20,
+  flySpeed: WORLD_SIZE * 0.35,
+});
+controls.set(new THREE.Vector3(0, WORLD_SIZE * 0.15, 0), { yaw: 0.6, pitch: -0.45, distance: WORLD_SIZE * 1.4 });
 
-function initPhysics() {
-  if (!RAPIER || physReady || !collider) return;
-  phys = new RAPIER.World({ x: 0, y: GRAVITY, z: 0 });
-  // the same merged environment geometry the player collides with, as a static trimesh
-  const pos = collider.geometry.attributes.position;
-  const idx = new Uint32Array(pos.count);
-  for (let i = 0; i < pos.count; i++) idx[i] = i;
-  phys.createCollider(RAPIER.ColliderDesc.trimesh(new Float32Array(pos.array), idx).setFriction(0.9));
-  // kinematic capsule mirroring the player, so walking into props shoves them
-  playerBody = phys.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased());
-  phys.createCollider(RAPIER.ColliderDesc.capsule(capsuleSegLength / 2, CAPSULE_RADIUS), playerBody);
-  physReady = true;
-}
+const gizmo = new TransformControls(camera, renderer.domElement);
+gizmo.setSpace('world');
+gizmo.addEventListener('dragging-changed', (e) => { controls.enabled = !e.value; });
+gizmo.addEventListener('objectChange', () => { selectionBox.update(); syncJointUI(); });
+// three r169+ splits the visual helper out of the controls object
+scene.add(gizmo.getHelper ? gizmo.getHelper() : gizmo);
 
-const PROP_DEFS = [
-  { kind: 'box', size: 0.55, color: 0xd35d47, name: 'crate-red' },
-  { kind: 'box', size: 0.45, color: 0x4f9dd8, name: 'crate-blue' },
-  { kind: 'box', size: 0.65, color: 0xd8b44f, name: 'crate-yellow' },
-  { kind: 'ball', size: 0.32, color: 0x7ac74f, name: 'ball-green' },
-];
+const selectionBox = new THREE.BoxHelper(new THREE.Object3D(), 0x7fd4ff);
+selectionBox.visible = false;
+selectionBox.material.depthTest = false;
+selectionBox.material.transparent = true;
+scene.add(selectionBox);
 
-function spawnProps(origin) {
-  if (!physReady || props.length) return;
-  PROP_DEFS.forEach((def, i) => {
-    const geom = def.kind === 'ball'
-      ? new THREE.SphereGeometry(def.size, 24, 16)
-      : new THREE.BoxGeometry(def.size, def.size, def.size);
-    const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({ color: def.color, roughness: 0.55, metalness: 0.05 }));
-    mesh.name = def.name;
-    scene.add(mesh);
-    const angle = (i / PROP_DEFS.length) * Math.PI * 2 + 0.6;
-    const home = { x: origin.x + Math.cos(angle) * 1.7, y: origin.y + 0.8 + i * 0.35, z: origin.z + Math.sin(angle) * 1.7 };
-    const body = phys.createRigidBody(
-      RAPIER.RigidBodyDesc.dynamic().setTranslation(home.x, home.y, home.z).setLinearDamping(0.05).setAngularDamping(0.15)
-    );
-    const col = def.kind === 'ball'
-      ? RAPIER.ColliderDesc.ball(def.size)
-      : RAPIER.ColliderDesc.cuboid(def.size / 2, def.size / 2, def.size / 2);
-    phys.createCollider(col.setFriction(0.8).setRestitution(def.kind === 'ball' ? 0.55 : 0.15).setDensity(1), body);
-    props.push({ mesh, body, home });
-  });
-}
-
-// Captured real objects: metric GLB -> scaled visual mesh + convex-hull physics body.
-function spawnObjectProps(origin) {
-  if (!physReady || !OBJECT_PROPS.length) return;
-  const loader = new GLTFLoader();
-  OBJECT_PROPS.forEach((def, i) => {
-    loader.load(def.url, (gltf) => {
-      const src = gltf.scene;
-      src.updateMatrixWorld(true);
-      const meshes = [];
-      src.traverse((o) => { if (o.isMesh) meshes.push(o); });
-      if (!meshes.length) return;
-
-      const scale = (def.scale ?? 1) * METERS_TO_WORLD;
-      src.scale.setScalar(scale);
-      src.updateMatrixWorld(true);
-      scene.add(src);
-
-      // Convex hull over all vertices. matrixWorld already carries the scale set
-      // above, and the hull must be centered on the body origin — so subtract the
-      // group's own position rather than scaling a second time.
-      const origin = new THREE.Vector3().setFromMatrixPosition(src.matrixWorld);
-      const pts = [];
-      for (const m of meshes) {
-        const p = m.geometry.attributes.position;
-        const v = new THREE.Vector3();
-        for (let k = 0; k < p.count; k++) {
-          v.fromBufferAttribute(p, k).applyMatrix4(m.matrixWorld).sub(origin);
-          pts.push(v.x, v.y, v.z);
-        }
-      }
-      const angle = (i / OBJECT_PROPS.length) * Math.PI * 2 - 0.8;
-      const home = { x: origin.x + Math.cos(angle) * 2.4, y: origin.y + 1.0, z: origin.z + Math.sin(angle) * 2.4 };
-      const body = phys.createRigidBody(
-        RAPIER.RigidBodyDesc.dynamic().setTranslation(home.x, home.y, home.z).setLinearDamping(0.05).setAngularDamping(0.2)
-      );
-      const desc = RAPIER.ColliderDesc.convexHull(new Float32Array(pts));
-      if (desc) phys.createCollider(desc.setFriction(0.9).setRestitution(0.05).setDensity(1), body);
-      props.push({ mesh: src, body, home });
-      console.log(`prop "${def.name}" loaded (${meshes.length} mesh(es), scale ${scale.toFixed(1)}x)`);
-    }, undefined, (err) => console.warn(`prop "${def.name}" failed to load`, err));
-  });
-}
-
-// grab / carry / throw (E — object under the crosshair)
-let carried = null;
-const grabRaycaster = new THREE.Raycaster();
-function toggleGrab() {
-  if (!physReady) return;
-  if (carried) { releaseCarried(); return; }
-  camera.updateMatrixWorld(); // matrices only refresh on render — force them current
-  for (const p of props) p.mesh.updateMatrixWorld(true);
-  grabRaycaster.setFromCamera({ x: 0, y: 0 }, camera);
-  grabRaycaster.far = 6;
-  // recursive: captured objects are GLB groups, primitives are bare meshes
-  const hit = grabRaycaster.intersectObjects(props.map(p => p.mesh), true)[0];
-  if (!hit) return;
-  const entry = props.find(p => {
-    let o = hit.object;
-    while (o) { if (o === p.mesh) return true; o = o.parent; }
-    return false;
-  });
-  if (!entry) return;
-  entry.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
-  const t = entry.body.translation();
-  carried = { entry, prev: new THREE.Vector3(t.x, t.y, t.z), vel: new THREE.Vector3() };
-}
-function releaseCarried() {
-  const { entry, vel } = carried;
-  entry.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
-  const v = vel.clampLength(0, 9); // throw with carry momentum, capped
-  entry.body.setLinvel({ x: v.x, y: v.y, z: v.z }, true);
-  carried = null;
-}
-
-let physAcc = 0;
-const FIXED_DT = 1 / 60;
-function stepPhysics(delta) {
-  if (!physReady) return;
-  playerBody.setNextKinematicTranslation({
-    x: player.position.x,
-    y: player.position.y + CAPSULE_HEIGHT / 2,
-    z: player.position.z,
-  });
-  if (carried) {
-    const dir = camera.getWorldDirection(new THREE.Vector3());
-    const target = camera.position.clone().addScaledVector(dir, 2.2);
-    const next = carried.prev.clone().lerp(target, Math.min(1, delta * 14));
-    carried.vel.copy(next).sub(carried.prev).divideScalar(Math.max(delta, 1e-4));
-    carried.prev.copy(next);
-    carried.entry.body.setNextKinematicTranslation({ x: next.x, y: next.y, z: next.z });
-  }
-  physAcc = Math.min(physAcc + delta, 0.2);
-  while (physAcc >= FIXED_DT) {
-    phys.timestep = FIXED_DT;
-    phys.step();
-    physAcc -= FIXED_DT;
-  }
-  for (const p of props) {
-    const t = p.body.translation(), r = p.body.rotation();
-    p.mesh.position.set(t.x, t.y, t.z);
-    p.mesh.quaternion.set(r.x, r.y, r.z, r.w);
-    if (t.y < -12 && carried?.entry !== p) { // fell off the world: back to home
-      p.body.setTranslation(p.home, true);
-      p.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
-      p.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
-    }
-  }
-}
-
-// ---------------------------------------------------------------- model loading
+// ---------------------------------------------------------------- world model
 const overlay = document.getElementById('overlay');
 const loadbarFill = document.querySelector('#loadbar div');
-const clicktip = document.getElementById('clicktip');
-const overlaySub = document.querySelector('#overlay .sub');
-let modelReady = false;
+const loadnote = document.getElementById('loadnote');
+let worldModel = null;
 
 // Photogrammetry scans come out slightly tilted (video frames carry no gravity
 // metadata) — measure the dominant upward-facing surface and rotate it level.
@@ -323,234 +181,456 @@ new GLTFLoader().load(
       }
     });
     scene.add(model);
+    worldModel = model;
     buildCollider();
-
-    // spawn on top of the scan: raycast down and drop in just above the surface,
-    // so the capsule never starts intersecting geometry
-    box = new THREE.Box3().setFromObject(model);
-    const cx = (box.min.x + box.max.x) / 2;
-    const cz = (box.min.z + box.max.z) / 2;
-    const ray = new THREE.Raycaster(new THREE.Vector3(cx, box.max.y + 5, cz), new THREE.Vector3(0, -1, 0));
-    const hit = ray.intersectObject(model, true)[0];
-    if (hit) SPAWN.set(cx, hit.point.y + 1.6, cz);
-    else SPAWN.set(cx, box.max.y + 2, cz);
-    respawn();
-    spawnProps(SPAWN);
-    spawnObjectProps(SPAWN);
-    modelReady = true;
-    loadbarFill.style.width = '100%';
-    document.getElementById('loadbar').style.display = 'none';
-    clicktip.style.display = 'block';
+    controls.frame(new THREE.Box3().setFromObject(model), { yaw: 0.6, pitch: -0.5 });
+    worldReady();
   },
   (ev) => {
-    if (ev.total) loadbarFill.style.width = `${Math.round((ev.loaded / ev.total) * 100)}%`;
+    if (ev.total) loadbarFill.style.width = `${Math.round((ev.loaded / ev.total) * 55)}%`;
   },
   (err) => {
     console.error('model load failed', err);
-    overlaySub.textContent = 'Could not load assets/desk.glb — run the reconstruction pipeline first. (Walking on the empty grid instead.)';
     buildCollider();
-    spawnProps(new THREE.Vector3(0, 1, 1.5));
-    modelReady = true;
-    document.getElementById('loadbar').style.display = 'none';
-    clicktip.style.display = 'block';
+    worldReady('Could not load assets/desk.glb — dropping assets onto the empty grid instead.');
   }
 );
 
-// ---------------------------------------------------------------- player
-const player = {
-  position: new THREE.Vector3(0, 2, 2.2),
-  velocity: new THREE.Vector3(),
-  onGround: false,
-  yaw: 0,
-  pitch: -0.15,
-};
-const SPAWN = player.position.clone();
-window.__player = player; // debug handle
-
-const keys = new Set();
-window.__keys = keys; // debug handle
-// arrows work everywhere, even where a host app steals single-letter shortcuts
-const KEY_ALIAS = { ArrowUp: 'KeyW', ArrowDown: 'KeyS', ArrowLeft: 'KeyA', ArrowRight: 'KeyD' };
-addEventListener('keydown', (e) => {
-  if (e.metaKey || e.ctrlKey || e.altKey) return; // shortcuts shouldn't latch movement
-  const code = KEY_ALIAS[e.code] || e.code;
-  if (KEY_ALIAS[e.code]) e.preventDefault(); // arrows shouldn't scroll the page
-  keys.add(code);
-  if (code === 'KeyR') respawn();
-  if (code === 'KeyE') toggleGrab();
-});
-addEventListener('keyup', (e) => keys.delete(KEY_ALIAS[e.code] || e.code));
-
-// a missed keyup (focus loss, Esc out of pointer lock, Cmd+Tab) would latch a key
-// forever -> phantom drift + the opposite key seeming dead. Clear on any state change.
-function clearKeys() { keys.clear(); dragging = false; }
-addEventListener('blur', clearKeys);
-document.addEventListener('visibilitychange', () => { if (document.hidden) clearKeys(); });
-
-function respawn() {
-  player.position.copy(SPAWN);
-  player.velocity.set(0, 0, 0);
-}
-
-// pointer lock with drag-to-look fallback (embedded panes, touch devices)
-let dragLook = false;
-let dragging = false;
-let entered = false;
-
-function enterWorld() {
-  entered = true;
-  overlay.style.display = 'none';
-}
-
-overlay.addEventListener('click', () => {
-  if (!modelReady) return;
-  const p = renderer.domElement.requestPointerLock?.();
-  if (p && p.catch) p.catch(() => { dragLook = true; enterWorld(); });
-  // if pointer lock never engages, fall back after a beat
-  setTimeout(() => {
-    if (!document.pointerLockElement) { dragLook = true; enterWorld(); }
-  }, 350);
-});
-document.addEventListener('pointerlockchange', () => {
-  clearKeys();
-  if (document.pointerLockElement) { dragLook = false; enterWorld(); }
-  else if (!dragLook) overlay.style.display = 'flex';
-});
-document.addEventListener('pointerlockerror', () => { dragLook = true; enterWorld(); });
-
-addEventListener('mousemove', (e) => {
-  if (document.pointerLockElement) {
-    player.yaw -= e.movementX * 0.0022;
-    player.pitch = Math.max(-1.45, Math.min(1.45, player.pitch - e.movementY * 0.0022));
-  } else if (dragLook && dragging) {
-    player.yaw -= e.movementX * 0.004;
-    player.pitch = Math.max(-1.45, Math.min(1.45, player.pitch - e.movementY * 0.004));
-  }
-});
-addEventListener('mousedown', () => { dragging = true; });
-addEventListener('mouseup', () => { dragging = false; });
-
-// ---------------------------------------------------------------- capsule vs BVH
-const upVector = new THREE.Vector3(0, 1, 0);
-const tempVector = new THREE.Vector3();
-const tempVector2 = new THREE.Vector3();
-const tempBox = new THREE.Box3();
-const tempMat = new THREE.Matrix4();
-const tempSegment = new THREE.Line3();
-const capsuleSegLength = CAPSULE_HEIGHT - 2 * CAPSULE_RADIUS;
-
-function updatePlayer(delta) {
-  player.velocity.y += GRAVITY * delta;
-
-  // horizontal input relative to yaw
-  const f = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
-  const s = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
-  const hasInput = f !== 0 || s !== 0;
-  const dir = tempVector.set(s, 0, -f).normalize().applyAxisAngle(upVector, player.yaw);
-  if (f || s) {
-    player.position.addScaledVector(dir, PLAYER_SPEED * delta);
-  }
-  if (keys.has('Space') && player.onGround) {
-    player.velocity.y = JUMP_VELOCITY;
-    player.onGround = false;
-  }
-  player.position.addScaledVector(player.velocity, delta);
-
-  if (!collider) return;
-
-  // capsule segment in collider local space (collider is at identity, but keep general)
-  tempSegment.start.copy(player.position);
-  tempSegment.start.y += CAPSULE_RADIUS + capsuleSegLength; // top sphere center
-  tempSegment.end.copy(player.position);
-  tempSegment.end.y += CAPSULE_RADIUS; // bottom sphere center
-
-  tempMat.copy(collider.matrixWorld).invert();
-  tempSegment.start.applyMatrix4(tempMat);
-  tempSegment.end.applyMatrix4(tempMat);
-
-  tempBox.makeEmpty();
-  tempBox.expandByPoint(tempSegment.start);
-  tempBox.expandByPoint(tempSegment.end);
-  tempBox.min.addScalar(-CAPSULE_RADIUS);
-  tempBox.max.addScalar(CAPSULE_RADIUS);
-
-  const triPoint = tempVector;
-  const capsulePoint = tempVector2;
-  collider.geometry.boundsTree.shapecast({
-    intersectsBounds: (box) => box.intersectsBox(tempBox),
-    intersectsTriangle: (tri) => {
-      const distance = tri.closestPointToSegment(tempSegment, triPoint, capsulePoint);
-      if (distance < CAPSULE_RADIUS) {
-        const depth = CAPSULE_RADIUS - distance;
-        const direction = capsulePoint.sub(triPoint).normalize();
-        tempSegment.start.addScaledVector(direction, depth);
-        tempSegment.end.addScaledVector(direction, depth);
-      }
+function worldReady(warning) {
+  loadbarFill.style.width = '60%';
+  loadnote.textContent = warning || 'loading SO-101 meshes…';
+  loadURDF(ASSETS.so101.url, {
+    onProgress: (done, total) => {
+      loadbarFill.style.width = `${60 + Math.round((done / total) * 40)}%`;
+      loadnote.textContent = `loading SO-101 meshes… ${done}/${total}`;
     },
-  });
+  })
+    .then((asset) => {
+      ASSETS.so101.asset = asset;
+      buildGhost(asset);
+      shelfItem.setAttribute('draggable', 'true');
+      shelfItem.setAttribute('aria-disabled', 'false');
+      shelfStatus.textContent = `${asset.spec.joints.filter((j) => j.type !== 'fixed').length} joints · URDF`;
+      dismissOverlay();
+    })
+    .catch((err) => {
+      console.error('URDF load failed', err);
+      shelfStatus.textContent = 'failed to load';
+      dismissOverlay();
+    });
+}
 
-  // resolved bottom-sphere center back in world space
-  const newPosition = tempSegment.end.clone().applyMatrix4(collider.matrixWorld);
-  newPosition.y -= CAPSULE_RADIUS; // back to feet
-  const deltaVector = newPosition.sub(player.position);
+function dismissOverlay() {
+  loadbarFill.style.width = '100%';
+  overlay.style.opacity = '0';
+  setTimeout(() => { overlay.style.display = 'none'; }, 380);
+}
 
-  player.onGround = deltaVector.y > Math.abs(delta * player.velocity.y * 0.25);
+// ---------------------------------------------------------------- instances
+const placed = [];
+let instanceCount = 0;
 
-  // standing still on ground: keep vertical support but cancel micro slope-slide
-  if (player.onGround && !hasInput) {
-    deltaVector.x = 0;
-    deltaVector.z = 0;
-  }
+function makeInstance(key) {
+  const entry = ASSETS[key];
+  if (!entry || !entry.asset) return null;
+  const robot = entry.asset.build();
+  robot.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(robot);
+  robot.position.y = -box.min.y; // stand the base on the instance origin
 
-  const offset = Math.max(0, deltaVector.length() - 1e-5);
-  deltaVector.normalize().multiplyScalar(offset);
-  player.position.add(deltaVector);
+  const inst = new THREE.Group();
+  inst.name = `${entry.label} ${String(++instanceCount).padStart(2, '0')}`;
+  inst.scale.setScalar(UNITS_PER_METER);
+  inst.userData = { assetKey: key, robot, isPlaced: true };
+  inst.add(robot);
+  return inst;
+}
 
-  if (player.onGround) {
-    // horizontal motion is position-driven (input); never let collision-injected
-    // momentum persist on the ground -> no phantom drift
-    player.velocity.set(0, Math.max(0, player.velocity.y), 0);
+// Drop a new arm turned toward the viewer: the URDF's base points along its own
+// +X, so we rotate that axis to face the camera.
+function facingYaw() {
+  return controls.yaw - Math.PI / 2;
+}
+
+function addInstance(key, position, yaw = 0) {
+  const inst = makeInstance(key);
+  if (!inst) return null;
+  inst.position.copy(position);
+  inst.rotation.y = yaw;
+  scene.add(inst);
+  placed.push(inst);
+  select(inst);
+  return inst;
+}
+
+function removeInstance(inst) {
+  const i = placed.indexOf(inst);
+  if (i >= 0) placed.splice(i, 1);
+  if (selection === inst) select(null);
+  scene.remove(inst);
+  // geometries and materials belong to the shared URDFAsset — nothing to dispose
+}
+
+// ---------------------------------------------------------------- drag preview
+let ghost = null;
+const ghostMaterial = new THREE.MeshBasicMaterial({
+  color: 0x7fd4ff, transparent: true, opacity: 0.4, depthWrite: false,
+});
+// radii are in the URDF's own metres — the ghost group applies the world scale
+const ghostRing = new THREE.Mesh(
+  new THREE.RingGeometry(0.13, 0.16, 40).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0x7fd4ff, transparent: true, opacity: 0.55, side: THREE.DoubleSide, depthTest: false })
+);
+
+function buildGhost(asset) {
+  const robot = asset.build(ghostMaterial);
+  robot.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(robot);
+  robot.position.y = -box.min.y;
+  ghost = new THREE.Group();
+  ghost.scale.setScalar(UNITS_PER_METER);
+  ghost.visible = false;
+  ghost.add(robot);
+  ghost.add(ghostRing);
+  scene.add(ghost);
+}
+
+// ---------------------------------------------------------------- picking
+const raycaster = new THREE.Raycaster();
+raycaster.firstHitOnly = true;
+const ndc = new THREE.Vector2();
+
+function toNDC(clientX, clientY) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+  return ndc;
+}
+
+/** Closest point on the desk / ground / other placed assets under the cursor. */
+function surfaceHit(clientX, clientY, exclude) {
+  raycaster.setFromCamera(toNDC(clientX, clientY), camera);
+  const targets = collider ? [collider] : [];
+  for (const p of placed) if (p !== exclude) targets.push(p);
+  return raycaster.intersectObjects(targets, true)[0] || null;
+}
+
+/** Straight-down probe used to keep a dragged object glued to whatever is beneath it. */
+const downRay = new THREE.Raycaster();
+downRay.firstHitOnly = true;
+function surfaceHeightAt(x, z, fromY, exclude) {
+  downRay.set(new THREE.Vector3(x, fromY, z), new THREE.Vector3(0, -1, 0));
+  const targets = collider ? [collider] : [];
+  for (const p of placed) if (p !== exclude) targets.push(p);
+  const hit = downRay.intersectObjects(targets, true)[0];
+  return hit ? hit.point.y : null;
+}
+
+function pickInstance(clientX, clientY) {
+  if (!placed.length) return null;
+  raycaster.setFromCamera(toNDC(clientX, clientY), camera);
+  const hit = raycaster.intersectObjects(placed, true)[0];
+  if (!hit) return null;
+  let o = hit.object;
+  while (o && !o.userData.isPlaced) o = o.parent;
+  return o ? { inst: o, point: hit.point } : null;
+}
+
+function dropToSurface(inst) {
+  const y = surfaceHeightAt(inst.position.x, inst.position.z, inst.position.y + WORLD_SIZE, inst);
+  if (y !== null) inst.position.y = y;
+  selectionBox.update();
+}
+
+// ---------------------------------------------------------------- selection
+let selection = null;
+
+function select(inst) {
+  selection = inst;
+  if (inst) {
+    gizmo.attach(inst);
+    selectionBox.setFromObject(inst);
+    selectionBox.visible = true;
   } else {
-    // slide: remove velocity into the surface
-    deltaVector.normalize();
-    player.velocity.addScaledVector(deltaVector, -deltaVector.dot(player.velocity));
-    // damp airborne horizontal momentum so glancing hits can't pump runaway speed
-    const damp = Math.max(0, 1 - 4 * delta);
-    player.velocity.x *= damp;
-    player.velocity.z *= damp;
+    gizmo.detach();
+    selectionBox.visible = false;
   }
-
-  if (player.position.y < -10) respawn();
+  refreshInspector();
 }
 
-function updateCamera() {
-  camera.position.copy(player.position);
-  camera.position.y += CAPSULE_HEIGHT - 0.12; // eyes near capsule top
-  camera.rotation.set(0, 0, 0);
-  camera.rotateY(player.yaw);
-  camera.rotateX(player.pitch);
+// ---------------------------------------------------------------- pointer input
+const shelfItem = document.getElementById('asset-so101');
+const shelfStatus = document.getElementById('asset-so101-status');
+
+let objDrag = null;      // { inst, offsetX, offsetZ, startX, startY, moved }
+let clickCandidate = null;
+
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (gizmo.dragging || gizmo.axis) return; // the gizmo owns this press
+
+  if (e.button === 1) { e.preventDefault(); controls.startDrag(e.shiftKey ? 'pan' : 'orbit', e); return; }
+  if (e.button === 2) { controls.startDrag('look', e); return; }
+  if (e.button !== 0) return;
+
+  if (e.altKey) { controls.startDrag(e.shiftKey ? 'pan' : 'orbit', e); return; }
+  if (e.shiftKey) { controls.startDrag('pan', e); return; }
+
+  const hit = pickInstance(e.clientX, e.clientY);
+  if (hit) {
+    select(hit.inst);
+    objDrag = {
+      inst: hit.inst,
+      offsetX: hit.inst.position.x - hit.point.x,
+      offsetZ: hit.inst.position.z - hit.point.z,
+      startX: e.clientX,
+      startY: e.clientY,
+      moved: false,
+    };
+    renderer.domElement.setPointerCapture?.(e.pointerId);
+  } else {
+    clickCandidate = { x: e.clientX, y: e.clientY };
+    controls.startDrag('orbit', e);
+  }
+});
+
+addEventListener('pointermove', (e) => {
+  if (!objDrag) return;
+  if (!objDrag.moved) {
+    if (Math.hypot(e.clientX - objDrag.startX, e.clientY - objDrag.startY) < 4) return;
+    objDrag.moved = true;
+  }
+  const hit = surfaceHit(e.clientX, e.clientY, objDrag.inst);
+  if (!hit) return;
+  // the cursor hit is under the grab point, not under the object's base — re-probe
+  // at the base's own x/z, from just above, so it tracks the surface it is sliding on
+  const x = hit.point.x + objDrag.offsetX;
+  const z = hit.point.z + objDrag.offsetZ;
+  const y = surfaceHeightAt(x, z, hit.point.y + WORLD_SIZE * 0.05, objDrag.inst);
+  objDrag.inst.position.set(x, y === null ? hit.point.y : y, z);
+  selectionBox.update();
+});
+
+addEventListener('pointerup', (e) => {
+  if (objDrag) {
+    renderer.domElement.releasePointerCapture?.(e.pointerId);
+    objDrag = null;
+  }
+  if (clickCandidate) {
+    // a press on empty space that never turned into an orbit = deselect
+    if (Math.hypot(e.clientX - clickCandidate.x, e.clientY - clickCandidate.y) < 4) select(null);
+    clickCandidate = null;
+  }
+});
+
+// ---------------------------------------------------------------- drag & drop
+function placementFromEvent(e) {
+  const hit = surfaceHit(e.clientX, e.clientY, null);
+  if (hit) return hit.point.clone();
+  // no surface under the cursor: drop it on the ground plane at the cursor ray
+  raycaster.setFromCamera(toNDC(e.clientX, e.clientY), camera);
+  const p = new THREE.Vector3();
+  return raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p) ? p : null;
 }
 
-// debug: drive the full sim without rAF (hidden tabs pause rAF)
-window.__step = (dt) => { updatePlayer(dt); updateCamera(); stepPhysics(dt); };
+shelfItem.addEventListener('dragstart', (e) => {
+  if (!ASSETS.so101.asset) { e.preventDefault(); return; }
+  e.dataTransfer.setData('text/plain', 'so101');
+  e.dataTransfer.effectAllowed = 'copy';
+});
+shelfItem.addEventListener('dragend', () => { if (ghost) ghost.visible = false; });
+
+renderer.domElement.addEventListener('dragover', (e) => {
+  if (!ghost) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+  const p = placementFromEvent(e);
+  ghost.visible = !!p;
+  if (p) ghost.position.copy(p);
+});
+renderer.domElement.addEventListener('dragleave', () => { if (ghost) ghost.visible = false; });
+renderer.domElement.addEventListener('drop', (e) => {
+  e.preventDefault();
+  if (ghost) ghost.visible = false;
+  const p = placementFromEvent(e);
+  if (p) addInstance('so101', p, facingYaw());
+});
+
+// click the shelf card to place one in front of the camera
+shelfItem.addEventListener('click', () => {
+  if (!ASSETS.so101.asset) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const fake = { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+  const p = placementFromEvent(fake) || controls.pivot.clone();
+  addInstance('so101', p, facingYaw());
+});
+
+// ---------------------------------------------------------------- keyboard
+const TYPING = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
+
+addEventListener('keydown', (e) => {
+  if (TYPING.has(e.target.tagName)) return;
+  if (e.metaKey || e.ctrlKey) return;
+  if (controls.flying) return; // WASD belongs to the fly camera while RMB is down
+
+  switch (e.code) {
+    case 'KeyG': setMode('translate'); break;
+    case 'KeyR': setMode('rotate'); break;
+    case 'KeyS': setMode('scale'); break;
+    case 'KeyF': frameSelection(); break;
+    case 'Home': frameAll(); break;
+    case 'Escape': select(null); break;
+    case 'KeyD':
+      if (e.shiftKey) duplicateSelection();
+      break;
+    case 'KeyX':
+    case 'Delete':
+    case 'Backspace':
+      if (selection) { e.preventDefault(); removeInstance(selection); }
+      break;
+    default: return;
+  }
+});
+
+// hold Ctrl/Cmd for grid snapping while dragging the gizmo
+addEventListener('keydown', (e) => {
+  if (e.key === 'Control' || e.key === 'Meta') {
+    gizmo.setTranslationSnap(WORLD_SIZE / 32);
+    gizmo.setRotationSnap(THREE.MathUtils.degToRad(15));
+    gizmo.setScaleSnap(0.1);
+  }
+});
+addEventListener('keyup', (e) => {
+  if (e.key === 'Control' || e.key === 'Meta') {
+    gizmo.setTranslationSnap(null);
+    gizmo.setRotationSnap(null);
+    gizmo.setScaleSnap(null);
+  }
+});
+
+function setMode(mode) {
+  gizmo.setMode(mode);
+  for (const b of document.querySelectorAll('#insp-modes button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.mode === mode));
+  }
+}
+
+function frameSelection() {
+  if (!selection) return frameAll();
+  controls.frame(new THREE.Box3().setFromObject(selection));
+}
+
+function frameAll() {
+  const box = new THREE.Box3();
+  if (worldModel) box.expandByObject(worldModel);
+  for (const p of placed) box.expandByObject(p);
+  if (box.isEmpty()) box.setFromCenterAndSize(new THREE.Vector3(), new THREE.Vector3(WORLD_SIZE, 1, WORLD_SIZE));
+  controls.frame(box);
+}
+
+function duplicateSelection() {
+  if (!selection) return;
+  const copy = makeInstance(selection.userData.assetKey);
+  if (!copy) return;
+  copy.position.copy(selection.position);
+  copy.quaternion.copy(selection.quaternion);
+  copy.scale.copy(selection.scale);
+  copy.position.x += WORLD_SIZE * 0.05;
+  for (const [name, j] of selection.userData.robot.joints) copy.userData.robot.setJointValue(name, j.value);
+  scene.add(copy);
+  placed.push(copy);
+  dropToSurface(copy);
+  select(copy);
+}
+
+// ---------------------------------------------------------------- inspector UI
+const inspector = document.getElementById('inspector');
+const inspName = document.getElementById('insp-name');
+const jointsBox = document.getElementById('joints');
+let jointRows = [];
+
+document.getElementById('insp-modes').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (b) setMode(b.dataset.mode);
+});
+document.getElementById('insp-drop').addEventListener('click', () => selection && dropToSurface(selection));
+document.getElementById('insp-dup').addEventListener('click', duplicateSelection);
+document.getElementById('insp-focus').addEventListener('click', frameSelection);
+document.getElementById('insp-del').addEventListener('click', () => selection && removeInstance(selection));
+
+function refreshInspector() {
+  jointRows = [];
+  if (!selection) { inspector.hidden = true; jointsBox.replaceChildren(); return; }
+  inspector.hidden = false;
+  inspName.textContent = selection.name;
+
+  const robot = selection.userData.robot;
+  jointsBox.replaceChildren();
+  if (!robot || !robot.joints.size) return;
+
+  const head = document.createElement('div');
+  head.className = 'jhead';
+  head.innerHTML = '<span>Joints</span>';
+  const reset = document.createElement('button');
+  reset.textContent = 'Reset';
+  reset.addEventListener('click', () => {
+    robot.resetJoints();
+    syncJointUI();
+    selectionBox.update();
+  });
+  head.appendChild(reset);
+  jointsBox.appendChild(head);
+
+  for (const [name, j] of robot.joints) {
+    const row = document.createElement('div');
+    row.className = 'joint';
+    const label = document.createElement('label');
+    label.textContent = name;
+    const out = document.createElement('output');
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = String(j.lower);
+    input.max = String(j.upper);
+    input.step = '0.005';
+    input.value = String(j.value);
+    input.addEventListener('input', () => {
+      robot.setJointValue(name, Number(input.value));
+      out.textContent = `${THREE.MathUtils.radToDeg(j.value).toFixed(0)}°`;
+      selectionBox.update();
+    });
+    out.textContent = `${THREE.MathUtils.radToDeg(j.value).toFixed(0)}°`;
+    row.append(label, out, input);
+    jointsBox.appendChild(row);
+    jointRows.push({ name, j, input, out });
+  }
+}
+
+function syncJointUI() {
+  for (const r of jointRows) {
+    r.input.value = String(r.j.value);
+    r.out.textContent = `${THREE.MathUtils.radToDeg(r.j.value).toFixed(0)}°`;
+  }
+}
 
 // ---------------------------------------------------------------- loop
 const clock = new THREE.Clock();
 function animate() {
   requestAnimationFrame(animate);
-  const delta = Math.min(clock.getDelta(), 0.05);
-  // substep for stability
-  const steps = 3;
-  for (let i = 0; i < steps; i++) updatePlayer(delta / steps);
-  updateCamera();
-  stepPhysics(delta);
-
+  controls.update(Math.min(clock.getDelta(), 0.05));
   renderer.render(scene, camera);
 }
 animate();
 
-addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight;
+function onViewportChange() {
+  const { w, h } = viewportSize();
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-});
+  renderer.setSize(w, h);
+}
+addEventListener('resize', onViewportChange);
+new ResizeObserver(onViewportChange).observe(container);
+
+// debug handle: drive the editor from the console / automation
+window.__editor = {
+  THREE, scene, camera, controls, gizmo, placed, ASSETS,
+  addInstance, removeInstance, select, frameAll, frameSelection, dropToSurface, syncJointUI,
+  get selection() { return selection; },
+};
