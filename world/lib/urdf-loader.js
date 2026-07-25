@@ -2,8 +2,9 @@
 //
 // Covers the subset onshape-to-robot emits (which is what the SO-101 uses):
 // named materials, link <visual> lists with mesh/box/cylinder/sphere geometry,
-// and fixed/revolute/continuous/prismatic joints. Collision geometry is ignored —
-// the scene raycasts against the visual meshes directly.
+// and fixed/revolute/continuous/prismatic joints. Mesh visuals may be .stl or
+// .obj (the Piper description ships OBJ + flat-colour MTL). Collision geometry
+// is ignored — the scene raycasts against the visual meshes directly.
 //
 // The URDF is parsed and its meshes fetched ONCE into a `URDFAsset`; every
 // `asset.build()` spawns a fresh instance that shares geometries and materials,
@@ -11,6 +12,8 @@
 
 import * as THREE from 'three';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------------------------------------------------------------- xml helpers
 const childrenByTag = (el, tag) => Array.from(el.children).filter((c) => c.tagName === tag);
@@ -87,6 +90,9 @@ function parseURDF(text, baseURL) {
     if (!parent || !child) continue;
     const limitEl = childByTag(j, 'limit');
     const axis = numbers(childByTag(j, 'axis') && childByTag(j, 'axis').getAttribute('xyz'), [1, 0, 0]);
+    // <mimic> couples a joint to another (the Piper's right finger tracks the
+    // left 1:1) — setting the master also drives every mimicking joint.
+    const mimicEl = childByTag(j, 'mimic');
     joints.push({
       name: j.getAttribute('name'),
       type: j.getAttribute('type') || 'fixed',
@@ -95,6 +101,11 @@ function parseURDF(text, baseURL) {
       axis: new THREE.Vector3().fromArray(axis),
       lower: limitEl ? Number(limitEl.getAttribute('lower') || 0) : 0,
       upper: limitEl ? Number(limitEl.getAttribute('upper') || 0) : 0,
+      mimic: mimicEl ? {
+        joint: mimicEl.getAttribute('joint'),
+        multiplier: mimicEl.hasAttribute('multiplier') ? Number(mimicEl.getAttribute('multiplier')) : 1,
+        offset: mimicEl.hasAttribute('offset') ? Number(mimicEl.getAttribute('offset')) : 0,
+      } : null,
       ...originOf(j),
     });
   }
@@ -135,7 +146,7 @@ export class URDFRobot extends THREE.Group {
     this.joints = new Map();
   }
 
-  setJointValue(name, value) {
+  setJointValue(name, value, _visited) {
     const j = this.joints.get(name);
     if (!j) return false;
     const v = j.type === 'continuous' ? value : THREE.MathUtils.clamp(value, j.lower, j.upper);
@@ -144,6 +155,13 @@ export class URDFRobot extends THREE.Group {
       j.node.position.copy(j.pos).addScaledVector(_axisWorld.copy(j.axis).applyQuaternion(j.quat), v);
     } else {
       j.node.quaternion.copy(j.quat).multiply(_q.setFromAxisAngle(j.axis, v));
+    }
+    // propagate to <mimic> followers (visited set guards against a mimic cycle)
+    const visited = _visited || new Set([name]);
+    for (const [otherName, other] of this.joints) {
+      if (!other.mimic || other.mimic.joint !== name || visited.has(otherName)) continue;
+      visited.add(otherName);
+      this.setJointValue(otherName, v * other.mimic.multiplier + other.mimic.offset, visited);
     }
     return true;
   }
@@ -243,6 +261,7 @@ export class URDFAsset {
           quat: j.quat.clone(),
           lower: j.type === 'continuous' ? -Math.PI : j.lower,
           upper: j.type === 'continuous' ? Math.PI : j.upper,
+          mimic: j.mimic,
           value: 0,
         });
       }
@@ -253,6 +272,53 @@ export class URDFAsset {
   }
 }
 
+// ---------------------------------------------------------------- mesh formats
+const isOBJ = (u) => /\.obj(\?|#|$)/i.test(u);
+
+// The Piper description colours its links through per-mesh .mtl files rather than
+// URDF <material> tags — honour the Kd (+ optional d alpha) when the URDF itself
+// said nothing. Missing/unreadable .mtl just means the default material.
+async function mtlColorOf(objURL) {
+  try {
+    const res = await fetch(objURL.replace(/\.obj(?=\?|#|$)/i, '.mtl'));
+    if (!res.ok) return null;
+    const text = await res.text();
+    const kd = text.match(/^\s*Kd\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)/m);
+    if (!kd) return null;
+    const d = text.match(/^\s*d\s+([\d.eE+-]+)/m);
+    return [Number(kd[1]), Number(kd[2]), Number(kd[3]), d ? Number(d[1]) : 1];
+  } catch {
+    return null;
+  }
+}
+
+async function loadGeometry(u, stl, obj) {
+  if (!isOBJ(u)) {
+    const geometry = await stl.loadAsync(u);
+    geometry.computeVertexNormals();
+    return geometry;
+  }
+  // OBJLoader returns a Group (one mesh per usemtl run) — a URDF visual is one
+  // rigid piece, so flatten it into a single geometry.
+  const group = await obj.loadAsync(u);
+  const parts = [];
+  group.traverse((o) => {
+    if (o.isMesh) parts.push(o.geometry.index ? o.geometry.toNonIndexed() : o.geometry);
+  });
+  if (!parts.length) throw new Error(`OBJ has no meshes: ${u}`);
+  // merge requires identical attribute sets — keep only what every part shares
+  const shared = parts
+    .map((g) => new Set(Object.keys(g.attributes)))
+    .reduce((a, b) => new Set([...a].filter((n) => b.has(n))));
+  for (const g of parts) {
+    for (const name of Object.keys(g.attributes)) if (!shared.has(name)) g.deleteAttribute(name);
+  }
+  const geometry = parts.length === 1 ? parts[0] : mergeGeometries(parts, false);
+  // the Piper OBJs carry no vn lines — flat CAD shading is the honest look
+  if (!geometry.attributes.normal) geometry.computeVertexNormals();
+  return geometry;
+}
+
 // ---------------------------------------------------------------- entry point
 export async function loadURDF(url, { onProgress } = {}) {
   const baseURL = new URL(url, location.href).href;
@@ -261,20 +327,32 @@ export async function loadURDF(url, { onProgress } = {}) {
   const spec = parseURDF(await res.text(), baseURL);
 
   const stl = new STLLoader();
+  const obj = new OBJLoader();
   const urls = [...spec.meshURLs];
   const geometries = new Map();
+  const mtlColors = new Map();
   let done = 0;
   await Promise.all(
     urls.map(async (u) => {
-      const geometry = await stl.loadAsync(u);
-      geometry.computeVertexNormals();
+      const [geometry, rgba] = await Promise.all([
+        loadGeometry(u, stl, obj),
+        isOBJ(u) ? mtlColorOf(u) : null,
+      ]);
       // main.js installs three-mesh-bvh on the prototype; use it when present so
       // dragging an arm around raycasts against it cheaply.
       if (geometry.computeBoundsTree) geometry.computeBoundsTree();
       geometries.set(u, geometry);
+      if (rgba) mtlColors.set(u, rgba);
       if (onProgress) onProgress(++done, urls.length);
     })
   );
+
+  // colour precedence: URDF material first, then the mesh's own .mtl, then default
+  for (const link of spec.links.values()) {
+    for (const v of link.visuals) {
+      if (!v.rgba && v.geom.type === 'mesh' && mtlColors.has(v.geom.url)) v.rgba = mtlColors.get(v.geom.url);
+    }
+  }
 
   return new URDFAsset(spec, geometries);
 }
