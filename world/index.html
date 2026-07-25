@@ -186,8 +186,15 @@
     background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
   }
   #campanel h2 button:hover { background: rgba(255,255,255,0.14); }
-  #camlens { color: var(--ink); font-size: 12px; margin-bottom: 8px; }
+  #camlens { color: var(--ink); font-size: 12px; margin-bottom: 4px; }
   #camlens b { color: var(--accent); font-weight: 600; }
+  /* where the numbers come from, and when they should not be trusted */
+  #camnote { margin: 0 0 8px; color: var(--dim); font-size: 10.5px; line-height: 1.4; }
+  #camwarn {
+    margin: 0 0 8px; padding: 6px 8px; border-radius: 6px; font-size: 10.5px; line-height: 1.4;
+    color: #ffd7a8; background: rgba(255,170,80,0.12); border: 1px solid rgba(255,170,80,0.32);
+  }
+  #camwarn[hidden] { display: none; }
   /* the live view is the sensor's own framing — its box follows the camera aspect */
   #camview {
     width: 100%; aspect-ratio: 16 / 9; border-radius: 7px;
@@ -255,6 +262,8 @@
   <h2>Camera <button id="camclose" type="button" title="Hide (C)">hide</button></h2>
   <div id="cambody" hidden>
     <div id="camlens">—</div>
+    <p id="camnote"></p>
+    <p id="camwarn" hidden></p>
     <div class="jhead" style="margin-bottom:8px">
       <label class="chk"><input type="checkbox" id="cam-frustum" checked>frustum</label>
       <label class="chk"><input type="checkbox" id="cam-live" checked>live view</label>
@@ -266,7 +275,7 @@
       <label for="cam-far">Far</label><input type="number" id="cam-far" step="5" min="1">
     </div>
     <div id="camderived"><span>degrees · cm</span><span>aspect <b id="cam-aspect">—</b></span></div>
-    <div class="row"><button id="cam-reset">Reset to datasheet</button></div>
+    <div class="row"><button id="cam-reset">Reset to defaults</button></div>
   </div>
   <p id="camempty">Drop a <b>Piper-X</b> into the scene — its URDF carries a wrist camera, and the virtual one mounts to the same link.</p>
 </div>
@@ -326,6 +335,6 @@
   }
 }
 </script>
-<script type="module" src="./main.js?v=27"></script>
+<script type="module" src="./main.js?v=28"></script>
 </body>
 </html>

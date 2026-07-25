@@ -46,7 +46,21 @@ const UNITS_PER_METER = WORLD_SIZE / DESK_SPAN_METERS;
 // This is only the built-in set. Anything dropped into world/assets/library/ is
 // discovered at boot and appended — see lib/asset-library.js.
 const ASSETS = {
-  so101: { url: './assets/so101/so101_new_calib.urdf', label: 'SO-101', kind: 'urdf', icon: '🦾' },
+  so101: {
+    url: './assets/so101/so101_new_calib.urdf', label: 'SO-101', kind: 'urdf', icon: '🦾',
+    // camera_link IS the optical frame here (the URDF says so): OpenCV / REP-104,
+    // +z along the lens, +x right, +y down. A half-turn about x flips it into
+    // three.js's convention (+y up, -z forward).
+    camera: {
+      link: 'camera_link',
+      rpy: [Math.PI, 0, 0],
+      label: 'Wrist cam',
+      fovY: 42, aspect: 4 / 3, near: 0.02, far: 0.6,
+      note: 'no datasheet in the URDF — generic 4:3 webcam, measure yours',
+      warn: 'the URDF calls this mount a placeholder ("KNOWN WRONG"): the bracket '
+          + 'position is not established yet, so the lens sits where the guess puts it.',
+    },
+  },
   piper: {
     url: './assets/piper_x_arm/piper_x_arm.urdf', label: 'Piper-X', kind: 'urdf', icon: '🦿',
     // Wrist RealSense D405. The URDF has the sensor *housing* frame but no optical
@@ -61,6 +75,7 @@ const ASSETS = {
       fovY: 58,                      // D405 RGB spec is 87° x 58° (H x V)
       aspect: 848 / 480,             // the stream's own aspect; tune it in the panel
       near: 0.03, far: 0.6,          // metres — the D405's usable depth range
+      note: 'D405 datasheet · 87° × 58°, from the source MJCF',
     },
   },
   bottle: { url: './assets/objects/test_bottle.glb', label: 'Bottle', kind: 'glb', icon: '🍶',
@@ -1302,6 +1317,8 @@ const camToggleBtn = document.getElementById('camtoggle');
 const camBody = document.getElementById('cambody');
 const camEmpty = document.getElementById('camempty');
 const camLensEl = document.getElementById('camlens');
+const camNoteEl = document.getElementById('camnote');
+const camWarnEl = document.getElementById('camwarn');
 const camViewEl = document.getElementById('camview');
 const camFrustumChk = document.getElementById('cam-frustum');
 const camLiveChk = document.getElementById('cam-live');
@@ -1344,6 +1361,10 @@ function refreshCameraPanel() {
   const who = document.createElement('b');
   who.textContent = inst.name;              // instance names can carry a filename
   camLensEl.append(who);
+  // say where these numbers came from, and flag the ones the URDF calls a guess
+  camNoteEl.textContent = spec.note || '';
+  camWarnEl.textContent = spec.warn || '';
+  camWarnEl.hidden = !spec.warn;
 
   camVFov.value = cfg.fovY.toFixed(1);
   camHFov.value = hFovOf(cfg).toFixed(1);
