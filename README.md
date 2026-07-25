@@ -42,3 +42,25 @@ names come straight from the handler
 The Piper X arm (`world/assets/piper/`, from actuacore-feetech's
 `models/piper_x_arm_description`) is on the shelf too — 7 controllable joints,
 the right finger mimics the left.
+
+### Drive the Pipers from the same arm
+
+`tools/so101_piper_ws_bridge.py` replaces the plain bridge: it additionally
+retargets the SO-101's TCP onto the Piper (scale ×1.7 + axis permutation, the
+same projection as actuacore-feetech's `project_so101_tcp_piper_viser.py`),
+solves Piper IK, and appends `joint1..joint6, gripper_left_joint` to the same
+WebSocket payload — so one connection drives every SO-101 *and* every Piper in
+the scene. It needs actuacore's kinematics source + pinocchio; from this repo's
+root (stop `so101_ws_bridge.py` first, both use port 8765):
+
+```bash
+PYTHONPATH="tools/stubs:$HOME/Documents/TODO/Coding/actuacore-feetech/src" \
+uv run --no-project --python 3.12 \
+  --with pin --with numpy --with pyyaml --with motorbridge --with python-can \
+  --with msgpack --with pyzmq --with websockets \
+  python tools/so101_piper_ws_bridge.py --host pc-chilly-chicken
+```
+
+(`tools/stubs/` fakes `ruckig`, whose sdist doesn't build on modern
+scikit-build-core; the bridge never uses it. `--scale` tunes the workspace
+mapping, default 1.7.)
