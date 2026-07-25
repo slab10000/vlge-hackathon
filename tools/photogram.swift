@@ -1,15 +1,18 @@
 import Foundation
 import RealityKit
 
-// Usage: photogram <inputFramesDir> <outputModelPath(.usdz)> <detail: preview|reduced|medium|full|raw>
+// Usage: photogram <inputFramesDir> <outputModelPath(.usdz)> <detail> [--object]
+//   --object turns on object masking: isolates ONE object from its background
+//            (use for capturing a single real object; omit for whole scenes)
 let args = CommandLine.arguments
 guard args.count >= 4 else {
-    print("usage: photogram <framesDir> <out.usdz> <detail>")
+    print("usage: photogram <framesDir> <out.usdz> <preview|reduced|medium|full|raw> [--object]")
     exit(1)
 }
 let inputURL = URL(fileURLWithPath: args[1], isDirectory: true)
 let outputURL = URL(fileURLWithPath: args[2])
 let detailArg = args[3]
+let objectMode = args.contains("--object")
 
 guard PhotogrammetrySession.isSupported else {
     print("ERROR: PhotogrammetrySession not supported on this Mac")
@@ -28,8 +31,10 @@ default: detail = .reduced
 
 var config = PhotogrammetrySession.Configuration()
 config.sampleOrdering = .sequential      // frames come from one continuous video
-config.featureSensitivity = .normal
-config.isObjectMaskingEnabled = false    // reconstruct the whole scene, not one object
+config.featureSensitivity = objectMode ? .high : .normal
+// scene mode reconstructs everything; object mode isolates the subject from its surroundings
+config.isObjectMaskingEnabled = objectMode
+print("MODE \(objectMode ? "object (masked, high sensitivity)" : "scene") · detail \(detailArg)")
 
 let session: PhotogrammetrySession
 do {

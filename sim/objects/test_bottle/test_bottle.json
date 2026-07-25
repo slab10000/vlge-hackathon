@@ -1,0 +1,23 @@
+{
+  "name": "test_bottle",
+  "source": "/private/tmp/claude-501/-Users-blasmorenolaguna-Documents-TODO-Coding-vlge-hackathon/4ef762d8-3894-4552-ae0d-712e141248d9/scratchpad/fake_bottle.glb",
+  "scale_applied": 0.011113917880859024,
+  "extents_m": [
+    0.08224299337826257,
+    0.22000000000000003,
+    0.08224299337826257
+  ],
+  "mass_kg": 0.5,
+  "com_z_m": 0.09187177550620346,
+  "diaginertia": [
+    0.0016663799366611397,
+    0.0016663799366611397,
+    0.0004036114214933662
+  ],
+  "mass_source": "measured",
+  "volume_l": 0.9646558613616995,
+  "convex_hulls": 4,
+  "friction": 0.8,
+  "web_asset": "world/assets/objects/test_bottle.glb",
+  "mjcf": "sim/objects/test_bottle/test_bottle.xml"
+}
