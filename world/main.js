@@ -5,6 +5,7 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 import { EditorControls } from './lib/editor-controls.js';
 import { loadURDF } from './lib/urdf-loader.js';
+import { scanLibrary, loadLibraryAsset, LIBRARY_URL } from './lib/asset-library.js';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -37,9 +38,12 @@ const WORLD_ROTATION = new THREE.Euler(0, 0, 0);
 const DESK_SPAN_METERS = 1.6;
 const UNITS_PER_METER = WORLD_SIZE / DESK_SPAN_METERS;
 
-// Droppable assets. URDF entries are articulated robots; GLB entries are real
-// objects captured with tools/make_object.py (already in metres, so they inherit
-// UNITS_PER_METER like everything else and land at true physical scale).
+// Droppable assets. URDF entries are articulated robots; mesh entries (.glb /
+// .gltf / .ply) are real objects captured with tools/make_object.py — already in
+// metres, so they inherit UNITS_PER_METER and land at true physical scale.
+//
+// This is only the built-in set. Anything dropped into world/assets/library/ is
+// discovered at boot and appended — see lib/asset-library.js.
 const ASSETS = {
   so101: { url: './assets/so101/so101_new_calib.urdf', label: 'SO-101', kind: 'urdf', icon: '🦾' },
   bottle: { url: './assets/objects/test_bottle.glb', label: 'Bottle', kind: 'glb', icon: '🍶',
@@ -425,56 +429,72 @@ if (scenarioPanel) {
 const remembered = SCENARIOS.find((s) => s.id === storage.get('scenario')) || SCENARIOS[0];
 loadScenario(remembered);
 
-// A captured GLB behaves like a URDF asset as far as the editor cares: it just
-// needs a build() that returns a fresh object (optionally in a ghost material).
-function loadGLBAsset(url) {
-  return new Promise((resolve, reject) => {
-    new GLTFLoader().load(url, (gltf) => {
-      const source = gltf.scene;
-      source.updateMatrixWorld(true);
-      resolve({
-        spec: null,
-        build(material) {
-          const copy = source.clone(true);
-          if (material) copy.traverse((o) => { if (o.isMesh) o.material = material; });
-          return copy;
+// One loader for every shelf entry. URDF entries go through the URDF parser; mesh
+// entries (.glb / .gltf / .ply — built-in, dropped into assets/library/, or dragged
+// in from Finder) go through the asset library. Both hand back the same
+// { build(material) -> Object3D } contract, so nothing downstream has to care.
+// Cached per key: dropping ten copies costs ten scene graphs, not ten downloads.
+function loadAsset(key, { onProgress } = {}) {
+  const entry = ASSETS[key];
+  if (!entry) return Promise.reject(new Error(`unknown asset "${key}"`));
+  if (entry.loading) return entry.loading;
+
+  const setStatus = (text) => {
+    const ui = shelfCards.get(key);
+    if (ui) ui.status.textContent = text;
+  };
+  setStatus('loading…');
+
+  const job = entry.kind === 'urdf'
+    ? loadURDF(entry.url, {
+        onProgress: (done, total) => {
+          setStatus(`meshes ${done}/${total}`);
+          onProgress?.(done / total);
         },
+      })
+    : loadLibraryAsset(entry.url, {
+        scale: entry.scale,
+        size: entry.size,
+        onProgress: (frac) => { setStatus(`loading ${Math.round(frac * 100)}%`); onProgress?.(frac); },
       });
-    }, undefined, reject);
-  });
+
+  entry.loading = job
+    .then((asset) => {
+      entry.asset = asset;
+      const joints = asset.spec?.joints?.filter((j) => j.type !== 'fixed').length;
+      markAssetReady(key, joints != null
+        ? `${joints} joints · URDF`
+        : (asset.note || entry.note || entry.kind.toUpperCase()));
+      return asset;
+    })
+    .catch((err) => {
+      console.error(`asset "${key}" failed to load`, err);
+      entry.loading = null;          // let a rescan / re-drop try again
+      setStatus('failed to load');
+      throw err;
+    });
+
+  return entry.loading;
 }
 
 function worldReady(warning) {
   loadbarFill.style.width = '60%';
   loadnote.textContent = warning || 'loading SO-101 meshes…';
 
-  const jobs = Object.entries(ASSETS).map(([key, entry]) => {
-    const loading = entry.kind === 'urdf'
-      ? loadURDF(entry.url, {
-          onProgress: (done, total) => {
-            loadbarFill.style.width = `${60 + Math.round((done / total) * 40)}%`;
-            loadnote.textContent = `loading ${entry.label} meshes… ${done}/${total}`;
-          },
-        })
-      : loadGLBAsset(entry.url);
-
-    return loading
-      .then((asset) => {
-        entry.asset = asset;
-        const joints = asset.spec?.joints?.filter((j) => j.type !== 'fixed').length;
-        markAssetReady(key, joints != null ? `${joints} joints · URDF` : (entry.note || 'GLB'));
-      })
-      .catch((err) => {
-        console.error(`asset "${key}" failed to load`, err);
-        const ui = shelfCards.get(key);
-        if (ui) ui.status.textContent = 'failed to load';
-      });
-  });
+  const jobs = Object.keys(ASSETS).map((key) =>
+    loadAsset(key, {
+      onProgress: (frac) => {
+        if (ASSETS[key].kind !== 'urdf') return;      // the URDF is the slow one
+        loadbarFill.style.width = `${60 + Math.round(frac * 40)}%`;
+        loadnote.textContent = `loading ${ASSETS[key].label} meshes… ${Math.round(frac * 100)}%`;
+      },
+    }).catch(() => null));
 
   Promise.allSettled(jobs).then(() => {
     const firstReady = Object.keys(ASSETS).find((k) => ASSETS[k].asset);
     if (firstReady) buildGhost(firstReady);
     dismissOverlay();
+    refreshLibrary();               // user-dropped files land after the world is up
   });
 }
 
@@ -622,16 +642,19 @@ function select(inst) {
 
 // ---------------------------------------------------------------- asset shelf
 const shelfList = document.getElementById('shelf-items');
+const libraryNote = document.getElementById('libnote');
 const shelfCards = new Map(); // key -> { card, status }
 
-for (const [key, entry] of Object.entries(ASSETS)) {
+function addShelfCard(key) {
+  const entry = ASSETS[key];
   const card = document.createElement('div');
   card.className = 'asset';
   card.setAttribute('aria-disabled', 'true');
-  card.title = `${entry.label} (${entry.kind.toUpperCase()})`;
+  card.title = `${entry.label} · ${entry.file || entry.url}`;
   card.innerHTML =
     `<div class="thumb">${entry.icon || '📦'}</div>` +
-    `<div class="meta"><b>${entry.label}</b><span>loading…</span></div>`;
+    `<div class="meta"><b></b><span>loading…</span></div>`;
+  card.querySelector('.meta b').textContent = entry.label;   // filenames are user input
   shelfList.appendChild(card);
   shelfCards.set(key, { card, status: card.querySelector('.meta span') });
 
@@ -650,7 +673,10 @@ for (const [key, entry] of Object.entries(ASSETS)) {
     const p = placementFromEvent(fake) || controls.pivot.clone();
     addInstance(key, p, facingYaw());
   });
+  return card;
 }
+
+for (const key of Object.keys(ASSETS)) addShelfCard(key);
 
 function markAssetReady(key, note) {
   const ui = shelfCards.get(key);
@@ -658,6 +684,88 @@ function markAssetReady(key, note) {
   ui.card.setAttribute('draggable', 'true');
   ui.card.setAttribute('aria-disabled', 'false');
   ui.status.textContent = note;
+}
+
+// ---------------------------------------------------------------- drop-in library
+// Everything in world/assets/library/ becomes a shelf card. No registration step:
+// the dev server lists the directory, we read the listing (see lib/asset-library.js).
+let scanning = false;
+
+// Big scans are heavy; a few at a time keeps the tab responsive while they arrive.
+async function loadInSeries(keys, width) {
+  const queue = keys.slice();
+  const worker = async () => {
+    while (queue.length) await loadAsset(queue.shift()).catch(() => null);
+  };
+  await Promise.all(Array.from({ length: Math.min(width, queue.length) }, worker));
+}
+
+async function refreshLibrary() {
+  if (scanning) return;
+  scanning = true;
+  const rescanBtn = document.getElementById('rescan');
+  if (rescanBtn) rescanBtn.disabled = true;
+
+  try {
+    const found = await scanLibrary();
+    const added = [];
+    for (const item of found) {
+      if (ASSETS[item.key]) continue;
+      ASSETS[item.key] = {
+        url: item.url, file: item.file, label: item.label, kind: item.kind,
+        icon: item.icon, scale: item.scale, size: item.size, source: 'library',
+      };
+      addShelfCard(item.key);
+      added.push(item.key);
+    }
+    setLibraryNote(found.length, added.length);
+    await loadInSeries(added, 2);
+  } catch (err) {
+    console.warn('library scan failed', err);
+    setLibraryNote(null);
+  } finally {
+    scanning = false;
+    if (rescanBtn) rescanBtn.disabled = false;
+  }
+}
+
+function setLibraryNote(total, added = 0) {
+  if (!libraryNote) return;
+  if (total === null) {
+    libraryNote.innerHTML =
+      `Could not read <code>${LIBRARY_URL}</code> — run <code>python3 tools/scan_assets.py</code>.`;
+    return;
+  }
+  const what = total
+    ? `${total} file${total === 1 ? '' : 's'} in <code>assets/library/</code>${added ? ` · +${added} new` : ''}`
+    : `Drop <b>.glb</b> / <b>.ply</b> files into <code>assets/library/</code>`;
+  libraryNote.innerHTML = `${what} — or drag one straight onto the view.`;
+}
+
+document.getElementById('rescan')?.addEventListener('click', refreshLibrary);
+
+// Files dragged in from Finder: usable immediately, but only for this session —
+// they live at a blob: URL, not on disk next to the world.
+let droppedCount = 0;
+async function adoptFiles(files, position) {
+  for (const file of files) {
+    const key = `file:${++droppedCount}:${file.name}`;
+    ASSETS[key] = {
+      url: URL.createObjectURL(file),
+      file: file.name,
+      label: file.name.replace(/\.[^.]+$/, ''),
+      kind: file.name.split('.').pop().toLowerCase(),
+      icon: '📥',
+      note: 'dropped file · copy into assets/library/ to keep',
+      source: 'drop',
+    };
+    addShelfCard(key);
+    try {
+      await loadAsset(key);
+      addInstance(key, position ? position.clone() : controls.pivot.clone(), facingYaw());
+    } catch { /* the card already says it failed */ }
+    URL.revokeObjectURL(ASSETS[key].url);   // the asset is in memory now
+  }
 }
 
 // ---------------------------------------------------------------- pointer input
@@ -732,7 +840,11 @@ function placementFromEvent(e) {
   return raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p) ? p : null;
 }
 
+const MODEL_FILE = /\.(glb|gltf|ply)$/i;
+const carriesFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+
 renderer.domElement.addEventListener('dragover', (e) => {
+  if (carriesFiles(e)) { if (ghost) ghost.visible = false; return; } // handled window-side
   if (!ghost) return;
   e.preventDefault();
   e.dataTransfer.dropEffect = 'copy';
@@ -742,11 +854,29 @@ renderer.domElement.addEventListener('dragover', (e) => {
 });
 renderer.domElement.addEventListener('dragleave', () => { if (ghost) ghost.visible = false; });
 renderer.domElement.addEventListener('drop', (e) => {
+  if (carriesFiles(e)) return;
   e.preventDefault();
   if (ghost) ghost.visible = false;
   const key = e.dataTransfer.getData('text/plain');
   const p = placementFromEvent(e);
   if (p && ASSETS[key]?.asset) addInstance(key, p, facingYaw());
+});
+
+// Files dragged in from Finder — caught on the window so a miss lands in the scene
+// instead of navigating the browser away from the editor.
+addEventListener('dragover', (e) => {
+  if (!carriesFiles(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+addEventListener('drop', (e) => {
+  if (!carriesFiles(e)) return;
+  e.preventDefault();
+  if (ghost) ghost.visible = false;
+  const files = Array.from(e.dataTransfer.files).filter((f) => MODEL_FILE.test(f.name));
+  if (!files.length) return;
+  const overCanvas = e.target === renderer.domElement;
+  adoptFiles(files, (overCanvas && placementFromEvent(e)) || null);
 });
 
 // ---------------------------------------------------------------- keyboard
@@ -828,7 +958,8 @@ function duplicateSelection() {
   copy.quaternion.copy(selection.quaternion);
   copy.scale.copy(selection.scale);
   copy.position.x += WORLD_SIZE * 0.05;
-  for (const [name, j] of selection.userData.robot.joints) copy.userData.robot.setJointValue(name, j.value);
+  // only URDF instances carry joints — a mesh asset is just a scene graph
+  for (const [name, j] of selection.userData.robot?.joints || []) copy.userData.robot.setJointValue(name, j.value);
   scene.add(copy);
   placed.push(copy);
   dropToSurface(copy);
@@ -858,7 +989,7 @@ function refreshInspector() {
 
   const robot = selection.userData.robot;
   jointsBox.replaceChildren();
-  if (!robot || !robot.joints.size) return;
+  if (!robot?.joints?.size) return;   // mesh assets have no joints panel
 
   const head = document.createElement('div');
   head.className = 'jhead';

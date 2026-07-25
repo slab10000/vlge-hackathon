@@ -65,7 +65,16 @@
   #shelf h2 {
     margin: 0 0 8px; font-size: 11px; letter-spacing: .09em;
     text-transform: uppercase; color: var(--dim); font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center;
   }
+  #rescan {
+    padding: 3px 8px; border-radius: 5px; cursor: pointer;
+    letter-spacing: 0; text-transform: none;
+    font: 500 11px -apple-system, system-ui, sans-serif; color: var(--ink);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+  }
+  #rescan:hover:not(:disabled) { background: rgba(255,255,255,0.14); }
+  #rescan:disabled { opacity: .5; cursor: progress; }
   .asset {
     display: flex; gap: 10px; align-items: center; width: 100%;
     padding: 8px; border-radius: 8px; cursor: grab;
@@ -83,7 +92,18 @@
   .asset .meta b { display: block; font-size: 13px; }
   .asset .meta span { color: var(--dim); font-size: 11px; }
   #shelf .hint { margin: 8px 2px 0; color: var(--dim); font-size: 11px; line-height: 1.45; }
-  #shelf-items { display: flex; flex-direction: column; gap: 6px; }
+  #shelf .hint code {
+    font: 10.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--ink); background: rgba(255,255,255,0.07);
+    padding: 1px 4px; border-radius: 4px;
+  }
+  /* the library can grow without limit — keep the shelf on screen */
+  #shelf-items {
+    display: flex; flex-direction: column; gap: 6px;
+    max-height: min(46vh, 340px); overflow-y: auto; overscroll-behavior: contain;
+  }
+  #shelf-items::-webkit-scrollbar { width: 6px; }
+  #shelf-items::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.18); border-radius: 3px; }
   #simulate {
     width: 100%; margin-top: 10px; padding: 7px; border-radius: 7px; cursor: pointer;
     font: 500 12px -apple-system, system-ui, sans-serif; color: var(--ink);
@@ -154,9 +174,10 @@
 <div id="scenarios"></div>
 
 <div id="shelf" class="card">
-  <h2>Assets</h2>
+  <h2>Assets <button id="rescan" type="button" title="Re-read world/assets/library/">Rescan</button></h2>
   <div id="shelf-items"></div>
   <p class="hint">Drag onto the scene to place, or click to drop one in front of the camera.</p>
+  <p class="hint" id="libnote">Drop <b>.glb</b> / <b>.ply</b> files into <code>assets/library/</code> — or drag one straight onto the view.</p>
   <button id="simulate" type="button" aria-pressed="false">▶ Simulate physics <kbd>P</kbd></button>
 </div>
 
@@ -200,6 +221,6 @@
   }
 }
 </script>
-<script type="module" src="./main.js?v=21"></script>
+<script type="module" src="./main.js?v=22"></script>
 </body>
 </html>
