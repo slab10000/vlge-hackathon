@@ -47,8 +47,10 @@ Guidance to present:
 ### Q3 — Video path (only if not already provided)
 
 If the user didn't point to a video, ask for the path. Also confirm which output
-slot to fill (default: replace `world/assets/desk.glb`; keep the old one as a
-`*_backup.glb` if the user wants it).
+slot to fill: the world supports multiple hot-swappable scenes, so the default is
+to **add** a new `world/assets/<name>.glb` plus a `SCENARIOS` entry in
+`world/main.js` (see Step 6). Only replace an existing GLB if the user asks
+(keep the old one as `*_backup.glb` if they want it).
 
 ---
 
@@ -131,12 +133,22 @@ triangles (2× the geometry of a `medium` bake, which was 28 MB). Args are
 DRACOLoader wired up — plain three.js `GLTFLoader` **silently fails** on Draco files
 (symptom: model never loads, world falls back to the empty grid).
 
-## Step 6 — Load in the world + cache-bust
+## Step 6 — Register in the world + cache-bust
 
-The viewer loads `world/assets/desk.glb` (see `MODEL_URL` in `world/main.js`).
-**Bump the version query** on the script tag in `world/index.html`
-(`main.js?v=N` → `v=N+1`) — browsers cache modules aggressively and the user
-will otherwise see the old build.
+The viewer loads scenes from the `SCENARIOS` registry at the top of
+`world/main.js` — add an entry for the new GLB:
+
+```js
+const SCENARIOS = [
+  { id: 'desk',   name: 'Desk',        url: './assets/desk.glb' },
+  { id: '<id>',   name: '<Nice Name>', url: './assets/<name>.glb' },
+];
+```
+
+Picker buttons (top-right) and number-key hotkeys are generated from this list
+automatically; the last-used scene persists via localStorage. **Bump the version
+query** on the script tag in `world/index.html` (`main.js?v=N` → `v=N+1`) —
+browsers cache modules aggressively and the user will otherwise see the old build.
 
 Serve and open:
 
