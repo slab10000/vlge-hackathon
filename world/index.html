@@ -135,17 +135,31 @@
   .row button kbd { font: inherit; color: var(--dim); }
   .row button.danger:hover { background: rgba(255,110,110,0.22); border-color: rgba(255,110,110,0.5); }
 
-  #joints { margin-top: 10px; border-top: 1px solid var(--edge); padding-top: 8px; }
-  #joints .jhead {
+  #joints, #size { margin-top: 10px; border-top: 1px solid var(--edge); padding-top: 8px; }
+  .jhead {
     display: flex; justify-content: space-between; align-items: center;
     font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
     color: var(--dim); font-weight: 600; margin-bottom: 6px;
   }
-  #joints .jhead button {
+  .jhead button {
     padding: 3px 8px; border-radius: 5px; cursor: pointer; text-transform: none; letter-spacing: 0;
     font: 500 11px -apple-system, system-ui, sans-serif; color: var(--ink);
     background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
   }
+  .jhead .chk {
+    display: flex; align-items: center; gap: 5px; cursor: pointer;
+    text-transform: none; letter-spacing: 0; font-weight: 500;
+  }
+  .jhead .chk input { margin: 0; accent-color: var(--accent); }
+
+  .sizerow { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 11px; }
+  .sizerow input {
+    width: 68px; padding: 4px 6px; border-radius: 5px; color: var(--ink);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--edge);
+    font: 500 11px -apple-system, system-ui, sans-serif;
+  }
+  .sizerow .unit { color: var(--dim); }
+  .sizerow output { margin-left: auto; color: var(--accent); font-variant-numeric: tabular-nums; }
   .joint { display: grid; grid-template-columns: 1fr auto; gap: 0 6px; margin-bottom: 5px; font-size: 11px; }
   .joint label { color: var(--dim); }
   .joint output { font-variant-numeric: tabular-nums; color: var(--accent); }
@@ -196,6 +210,20 @@
     <button id="insp-focus">Frame <kbd>F</kbd></button>
     <button id="insp-del" class="danger">Delete <kbd>X</kbd></button>
   </div>
+  <div id="size">
+    <div class="jhead">
+      <span>Size</span>
+      <label class="chk"><input type="checkbox" id="size-uniform" checked>keep ratio</label>
+    </div>
+    <div class="sizerow">
+      <input type="number" id="size-height" step="0.5" min="0.1">
+      <span class="unit">cm tall at rest</span>
+      <output id="size-factor">×1.00</output>
+    </div>
+    <div class="row">
+      <button id="size-default" title="New drops of this asset start at this size">Save as default size</button>
+    </div>
+  </div>
   <div id="joints"></div>
 </div>
 
@@ -221,6 +249,6 @@
   }
 }
 </script>
-<script type="module" src="./main.js?v=22"></script>
+<script type="module" src="./main.js?v=23"></script>
 </body>
 </html>

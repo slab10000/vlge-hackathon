@@ -50,6 +50,46 @@ const ASSETS = {
             note: 'captured object' },
 };
 
+// Size the next drop of each asset uses, as a multiple of true physical scale
+// (1 = the asset's own metres). Set from the inspector, kept across reloads.
+//
+// Keyed on its own map rather than on the ASSETS entries: library assets are
+// discovered after boot, and they must still pick up a size saved last session.
+const SIZE_STORE_KEY = 'deskTwin.assetScale';
+const UNIT_SCALE = new THREE.Vector3(1, 1, 1);
+const savedScales = new Map(); // asset key -> Vector3 multiple of physical scale
+
+function loadDefaultScales() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SIZE_STORE_KEY) || '{}');
+    for (const [key, v] of Object.entries(saved)) {
+      const ok = Array.isArray(v) && v.length === 3 && v.every((n) => Number.isFinite(n) && n > 0);
+      if (ok) savedScales.set(key, new THREE.Vector3().fromArray(v));
+    }
+  } catch (err) {
+    console.warn('ignoring unreadable saved asset sizes', err);
+  }
+}
+
+function saveDefaultScales() {
+  try {
+    const out = {};
+    for (const [key, v] of savedScales) {
+      if (!key.startsWith('file:')) out[key] = v.toArray(); // blob keys die with the session
+    }
+    localStorage.setItem(SIZE_STORE_KEY, JSON.stringify(out));
+  } catch (err) {
+    console.warn('could not persist asset sizes', err);
+  }
+}
+
+/** World scale a fresh instance of `key` should start at. */
+function defaultScaleOf(key) {
+  return (savedScales.get(key) || UNIT_SCALE).clone().multiplyScalar(UNITS_PER_METER);
+}
+
+loadDefaultScales();
+
 // ---------------------------------------------------------------- scene
 const container = document.getElementById('app');
 
@@ -240,7 +280,14 @@ controls.set(new THREE.Vector3(0, WORLD_SIZE * 0.15, 0), { yaw: 0.6, pitch: -0.4
 const gizmo = new TransformControls(camera, renderer.domElement);
 gizmo.setSpace('world');
 gizmo.addEventListener('dragging-changed', (e) => { controls.enabled = !e.value; });
-gizmo.addEventListener('objectChange', () => { selectionBox.update(); syncJointUI(); });
+gizmo.addEventListener('mouseDown', () => { scaleDragStart = selection ? selection.scale.clone() : null; });
+gizmo.addEventListener('mouseUp', () => { scaleDragStart = null; });
+gizmo.addEventListener('objectChange', () => {
+  lockAspectRatio();
+  selectionBox.update();
+  syncJointUI();
+  syncSizeUI();
+});
 // three r169+ splits the visual helper out of the controls object
 scene.add(gizmo.getHelper ? gizmo.getHelper() : gizmo);
 
@@ -518,8 +565,9 @@ function makeInstance(key) {
 
   const inst = new THREE.Group();
   inst.name = `${entry.label} ${String(++instanceCount).padStart(2, '0')}`;
-  inst.scale.setScalar(UNITS_PER_METER);
-  inst.userData = { assetKey: key, robot, isPlaced: true };
+  inst.scale.copy(defaultScaleOf(key));
+  // unscaled extents in the URDF's own metres, so the inspector can talk in cm
+  inst.userData = { assetKey: key, robot, isPlaced: true, baseSize: box.getSize(new THREE.Vector3()) };
   inst.add(robot);
   return inst;
 }
@@ -570,7 +618,7 @@ function buildGhost(key) {
   const box = new THREE.Box3().setFromObject(body);
   body.position.y = -box.min.y;
   ghost = new THREE.Group();
-  ghost.scale.setScalar(UNITS_PER_METER);
+  ghost.scale.copy(defaultScaleOf(key)); // preview the size that will be dropped
   ghost.visible = false;
   ghost.add(body);
   ghost.add(ghostRing);
@@ -678,12 +726,24 @@ function addShelfCard(key) {
 
 for (const key of Object.keys(ASSETS)) addShelfCard(key);
 
+const assetNotes = new Map(); // key -> the card's base subtitle, minus the size suffix
+
 function markAssetReady(key, note) {
   const ui = shelfCards.get(key);
   if (!ui) return;
   ui.card.setAttribute('draggable', 'true');
   ui.card.setAttribute('aria-disabled', 'false');
-  ui.status.textContent = note;
+  assetNotes.set(key, note);
+  refreshShelfNote(key);
+}
+
+// A saved default size is a setting you can't see in the scene — show it on the card.
+function refreshShelfNote(key) {
+  const ui = shelfCards.get(key);
+  if (!ui) return;
+  const f = savedScales.get(key);
+  const size = f && Math.abs(f.y - 1) > 0.005 ? ` · ×${f.y.toFixed(2)}` : '';
+  ui.status.textContent = `${assetNotes.get(key) || ''}${size}`;
 }
 
 // ---------------------------------------------------------------- drop-in library
@@ -981,11 +1041,72 @@ document.getElementById('insp-dup').addEventListener('click', duplicateSelection
 document.getElementById('insp-focus').addEventListener('click', frameSelection);
 document.getElementById('insp-del').addEventListener('click', () => selection && removeInstance(selection));
 
+// ---------------------------------------------------------------- size / scale
+const sizeUniform = document.getElementById('size-uniform');
+const sizeHeight = document.getElementById('size-height');
+const sizeFactorOut = document.getElementById('size-factor');
+const sizeDefaultBtn = document.getElementById('size-default');
+let scaleDragStart = null;
+
+/** Real-world height of an instance, in metres. */
+function heightOf(inst) {
+  return inst.userData.baseSize.y * (inst.scale.y / UNITS_PER_METER);
+}
+
+// TransformControls has no uniform mode — each handle drives its own axis. Find
+// the axis the drag actually changed and mirror its ratio onto the other two.
+function lockAspectRatio() {
+  if (!sizeUniform.checked || gizmo.mode !== 'scale' || !selection || !scaleDragStart) return;
+  const s = selection.scale;
+  const s0 = scaleDragStart;
+  if (!s0.x || !s0.y || !s0.z) return;
+  let ratio = s.x / s0.x;
+  for (const r of [s.y / s0.y, s.z / s0.z]) {
+    if (Math.abs(r - 1) > Math.abs(ratio - 1)) ratio = r;
+  }
+  s.copy(s0).multiplyScalar(ratio);
+}
+
+function syncSizeUI() {
+  if (!selection || !selection.userData.baseSize) return;
+  sizeHeight.value = (heightOf(selection) * 100).toFixed(1);
+  sizeFactorOut.textContent = `×${(selection.scale.y / UNITS_PER_METER).toFixed(2)}`;
+}
+
+// typing a height always scales uniformly — one number, one ratio
+sizeHeight.addEventListener('input', () => {
+  if (!selection) return;
+  const metres = Number(sizeHeight.value) / 100;
+  const base = selection.userData.baseSize;
+  if (!(metres > 0) || !base || !(base.y > 0)) return;
+  selection.scale.setScalar((metres / base.y) * UNITS_PER_METER);
+  selectionBox.update();
+  sizeFactorOut.textContent = `×${(selection.scale.y / UNITS_PER_METER).toFixed(2)}`;
+});
+
+sizeDefaultBtn.addEventListener('click', () => {
+  if (!selection) return;
+  const key = selection.userData.assetKey;
+  savedScales.set(key, selection.scale.clone().divideScalar(UNITS_PER_METER));
+  saveDefaultScales();
+  if (ghost && ghostKey === key) ghost.scale.copy(selection.scale);
+  refreshShelfNote(key);
+  flash(sizeDefaultBtn, `Default: ${(heightOf(selection) * 100).toFixed(0)} cm ✓`);
+});
+
+function flash(button, text) {
+  if (!button.dataset.label) button.dataset.label = button.textContent;
+  button.textContent = text;
+  clearTimeout(button._flashTimer);
+  button._flashTimer = setTimeout(() => { button.textContent = button.dataset.label; }, 1400);
+}
+
 function refreshInspector() {
   jointRows = [];
   if (!selection) { inspector.hidden = true; jointsBox.replaceChildren(); return; }
   inspector.hidden = false;
   inspName.textContent = selection.name;
+  syncSizeUI();
 
   const robot = selection.userData.robot;
   jointsBox.replaceChildren();
@@ -1063,5 +1184,6 @@ new ResizeObserver(onViewportChange).observe(container);
 window.__editor = {
   THREE, scene, camera, controls, gizmo, placed, ASSETS,
   addInstance, removeInstance, select, frameAll, frameSelection, dropToSurface, syncJointUI,
+  defaultScaleOf, saveDefaultScales, heightOf,
   get selection() { return selection; },
 };
