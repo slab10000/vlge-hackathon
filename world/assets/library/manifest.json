@@ -1,0 +1,15 @@
+[
+  {
+    "file": "camera_object.ply",
+    "label": "Camera Splat",
+    "icon": "🌫️"
+  },
+  {
+    "file": "camera_object_glb.glb",
+    "label": "Camera object glb"
+  },
+  {
+    "file": "object_0.glb",
+    "label": "Object 0"
+  }
+]

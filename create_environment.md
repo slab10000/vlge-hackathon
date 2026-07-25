@@ -25,7 +25,7 @@ Timings/sizes measured on this machine (M-series, ~200 4K frames):
 | `preview` | ~1–3 min | ~2–5 MB | Sanity check that reconstruction works at all |
 | `reduced` | ~8 min | ~11 → 10 MB | Fast iteration; fine geometry test |
 | `medium` | ~10 min | ~32 → 29 MB | **Recommended default** — good quality, still loads fast in the browser |
-| `full` | ~25–60+ min | ~80–200 MB (estimate) | Maximum built-in quality; heavy for web — warn the user about load time |
+| `full` | ~28 min (413 frames) | 120 MB raw → **4.8 MB optimized** | **Best quality/size** — 100k tris + 8K maps; requires Step 5b |
 | `raw` | longest | largest | Every detail, no compression; offline/archival use, not for the browser |
 
 Note for the user: capture quality matters more than the preset — a slow 2–3 min
@@ -115,6 +115,23 @@ tools/photogram "$SCRATCH/frames" "$SCRATCH/model/scene.usdz" <preset>
 
 If replacing an existing asset the user wants kept, `mv` the old one to
 `world/assets/<name>_backup.glb` first.
+
+## Step 5b — Optimize for the web (REQUIRED after a `full`/`raw` bake)
+
+File size here is **textures, not geometry**. A `full` bake is only ~100k triangles but ships
+8192×8192 colour + normal + roughness maps as PNG — 120 MB. Halving texture edge length
+quarters that, and JPEG re-encoding does the rest:
+
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender --background \
+  --python tools/optimize_glb.py -- "$SCRATCH/model/scene.glb" "world/assets/desk.glb" 4096
+```
+
+Measured on this repo's capture: **120 MB → 4.8 MB** with no visible loss, keeping all 100k
+triangles (2× the geometry of a `medium` bake, which was 28 MB). Args are
+`<in> <out> [max_texture=4096] [target_tris=0]`; add `--draco` only if the viewer has a
+DRACOLoader wired up — plain three.js `GLTFLoader` **silently fails** on Draco files
+(symptom: model never loads, world falls back to the empty grid).
 
 ## Step 6 — Register in the world + cache-bust
 
