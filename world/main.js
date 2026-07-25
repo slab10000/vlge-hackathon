@@ -6,6 +6,7 @@ import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-
 import { EditorControls } from './lib/editor-controls.js';
 import { loadURDF } from './lib/urdf-loader.js';
 import { scanLibrary, loadLibraryAsset, LIBRARY_URL } from './lib/asset-library.js';
+import { LiveDrive } from './lib/live-drive.js';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -47,6 +48,7 @@ const UNITS_PER_METER = WORLD_SIZE / DESK_SPAN_METERS;
 // discovered at boot and appended — see lib/asset-library.js.
 const ASSETS = {
   so101: { url: './assets/so101/so101_new_calib.urdf', label: 'SO-101', kind: 'urdf', icon: '🦾' },
+  piper: { url: './assets/piper/piper_x_arm.urdf', label: 'Piper X', kind: 'urdf', icon: '🤖' },
   bottle: { url: './assets/objects/test_bottle.glb', label: 'Bottle', kind: 'glb', icon: '🍶',
             note: 'captured object' },
 };
@@ -509,7 +511,7 @@ function loadAsset(key, { onProgress } = {}) {
   entry.loading = job
     .then((asset) => {
       entry.asset = asset;
-      const joints = asset.spec?.joints?.filter((j) => j.type !== 'fixed').length;
+      const joints = asset.spec?.joints?.filter((j) => j.type !== 'fixed' && !j.mimic).length;
       markAssetReady(key, joints != null
         ? `${joints} joints · URDF`
         : (asset.note || entry.note || entry.kind.toUpperCase()));
@@ -568,7 +570,8 @@ function makeInstance(key) {
   inst.name = `${entry.label} ${String(++instanceCount).padStart(2, '0')}`;
   inst.scale.copy(defaultScaleOf(key));
   // unscaled extents in the URDF's own metres, so the inspector can talk in cm
-  inst.userData = { assetKey: key, robot, isPlaced: true, baseSize: box.getSize(new THREE.Vector3()) };
+  // `live: true` — follow the live joint stream by default; toggled per instance
+  inst.userData = { assetKey: key, robot, isPlaced: true, live: true, baseSize: box.getSize(new THREE.Vector3()) };
   inst.add(robot);
   return inst;
 }
@@ -1116,6 +1119,19 @@ function refreshInspector() {
   const head = document.createElement('div');
   head.className = 'jhead';
   head.innerHTML = '<span>Joints</span>';
+  // follow/ignore the live stream per instance — one arm can mirror the real
+  // robot while another stays hand-posed
+  const follow = document.createElement('label');
+  follow.className = 'chk';
+  follow.title = 'Follow the live joint stream when connected';
+  const followChk = document.createElement('input');
+  followChk.type = 'checkbox';
+  followChk.checked = selection.userData.live !== false;
+  followChk.addEventListener('change', () => {
+    selection.userData.live = followChk.checked;
+    syncLiveJointLock();
+  });
+  follow.append(followChk, document.createTextNode('live'));
   const reset = document.createElement('button');
   reset.textContent = 'Reset';
   reset.addEventListener('click', () => {
@@ -1123,10 +1139,11 @@ function refreshInspector() {
     syncJointUI();
     selectionBox.update();
   });
-  head.appendChild(reset);
+  head.append(follow, reset);
   jointsBox.appendChild(head);
 
   for (const [name, j] of robot.joints) {
+    if (j.mimic) continue; // driven by its master joint — a slider would fight it
     const row = document.createElement('div');
     row.className = 'joint';
     const label = document.createElement('label');
@@ -1148,6 +1165,7 @@ function refreshInspector() {
     jointsBox.appendChild(row);
     jointRows.push({ name, j, input, out });
   }
+  syncLiveJointLock();
 }
 
 function syncJointUI() {
@@ -1156,6 +1174,83 @@ function syncJointUI() {
     r.out.textContent = `${THREE.MathUtils.radToDeg(r.j.value).toFixed(0)}°`;
   }
 }
+
+// ---------------------------------------------------------------- live mirroring
+// The robot laptop runs actuacore-feetech's zmq_so_arm_handler.py with
+// ACTUACORE_ZMQ_TRANSPORT=tcp; tools/so101_ws_bridge.py runs HERE and turns that
+// ZMQ stream into ws://localhost:8765. Every placed arm whose joint names match
+// the incoming state follows it (uncheck "live" in the inspector to hand-pose
+// one while the rest keep mirroring).
+const liveUrl = document.getElementById('live-url');
+const liveBtn = document.getElementById('live-connect');
+const liveDot = document.getElementById('live-dot');
+const liveNote = document.getElementById('live-note');
+
+liveUrl.value = storage.get('liveUrl') || 'ws://localhost:8765';
+
+let liveDriven = 0;  // instances the last state message actually moved
+let liveNames = [];  // joint_names of the last state message
+
+function applyLiveState(msg) {
+  liveDriven = 0;
+  liveNames = msg.joint_names;
+  for (const inst of placed) {
+    const robot = inst.userData.robot;
+    if (!robot?.joints?.size || inst.userData.live === false) continue;
+    let moved = false;
+    for (let i = 0; i < msg.joint_names.length; i++) {
+      const v = msg.joint_pos[i];
+      if (v == null) continue; // that servo's read failed — keep the last pose
+      if (robot.setJointValue(msg.joint_names[i], v)) moved = true;
+    }
+    if (moved) liveDriven++;
+  }
+  if (liveDriven) syncJointUI();
+}
+
+// grey out the sliders of a robot that is being live-driven — wiggling them
+// would just fight the stream
+function syncLiveJointLock() {
+  const robot = selection?.userData.robot;
+  const lock = live.status === 'live'
+    && selection?.userData.live !== false
+    && !!robot?.joints
+    && liveNames.some((n) => robot.joints.has(n));
+  for (const r of jointRows) r.input.disabled = lock;
+}
+
+function updateLiveUI() {
+  liveDot.dataset.state = live.status;
+  liveBtn.textContent = live.enabled ? 'Stop' : 'Connect';
+  if (live.status === 'live') {
+    const hz = `${Math.round(live.rate)} Hz`;
+    liveNote.textContent = liveDriven
+      ? `${hz} — driving ${liveDriven} arm${liveDriven === 1 ? '' : 's'}`
+      : `${hz} — drop a matching arm (SO-101) to see it move`;
+  } else if (live.status === 'waiting') {
+    liveNote.textContent = 'connected — waiting for joint states…';
+  } else if (live.status === 'connecting') {
+    liveNote.textContent = 'connecting…';
+  } else if (live.status === 'retry') {
+    liveNote.textContent = 'stream dropped — retrying…';
+  } else {
+    liveNote.innerHTML =
+      'Mirror the real arm: <code>python3 tools/so101_ws_bridge.py --host &lt;robot-laptop&gt;</code> on this machine, then Connect.';
+  }
+  syncLiveJointLock();
+}
+
+const live = new LiveDrive({ onState: applyLiveState, onStatus: updateLiveUI });
+updateLiveUI();
+
+liveBtn.addEventListener('click', () => {
+  if (live.enabled) { live.disconnect(); return; }
+  const url = liveUrl.value.trim();
+  if (!url) return;
+  storage.set('liveUrl', url);
+  live.connect(url);
+});
+liveUrl.addEventListener('keydown', (e) => { if (e.key === 'Enter') liveBtn.click(); });
 
 // ---------------------------------------------------------------- loop
 const clock = new THREE.Clock();

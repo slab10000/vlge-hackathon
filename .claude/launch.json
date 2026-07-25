@@ -3,9 +3,10 @@
   "configurations": [
     {
       "name": "world",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8125", "--directory", "world"],
-      "port": 8125
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "exec python3 -m http.server \"${PORT:-8125}\" --directory world"],
+      "port": 8125,
+      "autoPort": true
     }
   ]
 }

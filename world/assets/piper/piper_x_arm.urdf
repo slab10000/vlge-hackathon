@@ -1,0 +1,274 @@
+<?xml version="1.0" ?>
+<!-- Single Piper-X arm extracted from cell_v0_4_description (left arm chain).
+     Link/joint names are unprefixed and the root is base_link at the origin; mount the arm
+     by adding a fixed joint from your own world link (the cell mounts it at
+     xyz="0.03 0.3 0.026" for left, xyz="0.03 -0.3 0.026" for right).
+
+     Visual geometry:    meshes/*.obj   (+ .mtl, colored) from scene.urdf
+     Collision geometry: meshes/*_c.stl from piper_x_left_arm.xml, where every collision geom
+                         is attached with no pos/quat -> identity origin in the link frame.
+     The collision meshes are the same geometry as the visuals, so they align exactly.
+     Adjacent links touch by design; disable those pairs in your planner/sim (see README). -->
+<robot name="piper_x_arm">
+   <link name="base_link">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="1.22721"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="base_link_visual">
+         <origin xyz="-0.011244281468016997 -1.010561477046947e-06 0.03392008272690317" rpy="1.7426486088546889 0.00017701955199189712 1.5709460178032604"/>
+         <geometry>
+            <mesh filename="meshes/base_link.obj"/>
+         </geometry>
+      </visual>
+      <collision name="base_link_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/base_link_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <link name="link2">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.81975"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="link2_visual">
+         <origin xyz="-9.767122197863375e-05 0.0009453204458628601 0.1138690870616691" rpy="1.6250494109953584 0.016684562283199478 -0.0028763569011144297"/>
+         <geometry>
+            <mesh filename="meshes/link_2.obj"/>
+         </geometry>
+      </visual>
+      <collision name="link2_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/link_2_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <joint type="revolute" name="joint1">
+      <parent link="base_link"/>
+      <child link="link2"/>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <axis xyz="0.0 0.0 1.0"/>
+      <limit lower="-2.6005" upper="2.6005" effort="100" velocity="100"/>
+   </joint>
+   <link name="link3">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.92783"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="link3_visual">
+         <origin xyz="-0.1742261888136016 0.0012168272137474824 0.005773590190610324" rpy="-2.8198409023950175 -1.4697941391757023 -0.32662181087703535"/>
+         <geometry>
+            <mesh filename="meshes/link_3.obj"/>
+         </geometry>
+      </visual>
+      <collision name="link3_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/link_3_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <joint type="revolute" name="joint2">
+      <parent link="link2"/>
+      <child link="link3"/>
+      <origin xyz="0.0 0.0 0.119" rpy="0.0 0.0 0.0"/>
+      <axis xyz="0.0 1.0 0.0"/>
+      <limit lower="0.0" upper="3.3161" effort="100" velocity="100"/>
+   </joint>
+   <link name="link4">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.68003"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="link4_visual">
+         <origin xyz="0.16005931792141162 0.0014236830679848524 0.0305053649311999" rpy="0.1056889750676342 -1.4631117698064668 3.0506784591904816"/>
+         <geometry>
+            <mesh filename="meshes/link_4.obj"/>
+         </geometry>
+      </visual>
+      <collision name="link4_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/link_4_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <joint type="revolute" name="joint3">
+      <parent link="link3"/>
+      <child link="link4"/>
+      <origin xyz="-0.283586 0.0 0.02883" rpy="0.0 0.0 0.0"/>
+      <axis xyz="0.0 1.0 0.0"/>
+      <limit lower="-2.9671" upper="0.0" effort="100" velocity="100"/>
+   </joint>
+   <link name="link5">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.4411"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="link5_visual">
+         <origin xyz="0.05088288951763401 -0.004411009807068545 0.04450435825574476" rpy="0.6893691258930872 -0.0061238953567661625 1.9082920001257193"/>
+         <geometry>
+            <mesh filename="meshes/link_5.obj"/>
+         </geometry>
+      </visual>
+      <collision name="link5_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/link_5_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <joint type="revolute" name="joint4">
+      <parent link="link4"/>
+      <child link="link5"/>
+      <origin xyz="0.269798 0.0 0.045672" rpy="0.0 0.0 0.0"/>
+      <axis xyz="0.0 1.0 0.0"/>
+      <limit lower="-1.4835" upper="1.4835" effort="100" velocity="100"/>
+   </joint>
+   <link name="link6">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.2945"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="link6_visual">
+         <origin xyz="0.012282412776116206 -0.00023994273150809218 -0.02916035091113167" rpy="0.0370251996873707 -0.42052079595058434 -0.006102755997939965"/>
+         <geometry>
+            <mesh filename="meshes/link_6.obj"/>
+         </geometry>
+      </visual>
+      <collision name="link6_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/link_6_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <joint type="revolute" name="joint5">
+      <parent link="link5"/>
+      <child link="link6"/>
+      <origin xyz="0.073273 0.0 0.042046" rpy="0.0 0.0 0.0"/>
+      <axis xyz="0.08687035133604572 0.0 -0.9962196254133683"/>
+      <limit lower="-1.4835" upper="1.4835" effort="100" velocity="100"/>
+   </joint>
+   <link name="gripper_body">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.056113"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="gripper_body_visual">
+         <origin xyz="0.031190171230021033 -0.000554741960304047 0.014723965936904084" rpy="0.26350911894661133 -0.5758847821637075 0.009503250093641474"/>
+         <geometry>
+            <mesh filename="meshes/gripper_body.obj"/>
+         </geometry>
+      </visual>
+      <collision name="gripper_body_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/gripper_body_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <joint type="revolute" name="joint6">
+      <parent link="link6"/>
+      <child link="gripper_body"/>
+      <origin xyz="0.038223 0.0 -0.03229" rpy="0.0 0.0 0.0"/>
+      <axis xyz="0.9962196254133683 0.0 0.08687035133604572"/>
+      <limit lower="-2.7925" upper="2.7925" effort="100" velocity="100"/>
+   </joint>
+   <link name="gripper_left">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.0264822"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="gripper_left_visual">
+         <origin xyz="0.02144491209430425 0.009877865742879091 0.002638495140358883" rpy="1.5458242052962465 -0.021750323645520542 1.3823532094128808"/>
+         <geometry>
+            <mesh filename="meshes/gripper_left.obj"/>
+         </geometry>
+      </visual>
+      <collision name="gripper_left_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/gripper_left_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <joint type="prismatic" name="gripper_left_joint">
+      <parent link="gripper_body"/>
+      <child link="gripper_left"/>
+      <origin xyz="0.06662 0.0 0.005829" rpy="0.0 0.0 0.0"/>
+      <axis xyz="0.0 1.0 0.0"/>
+      <limit lower="0.0" upper="0.05" effort="5" velocity="100"/>
+   </joint>
+   <link name="gripper_right">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.0264822"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="gripper_right_visual">
+         <origin xyz="0.02157728519612355 -0.009877865768961358 0.001125459272327901" rpy="1.4243596459137853 0.011103826152435436 1.760154332439164"/>
+         <geometry>
+            <mesh filename="meshes/gripper_right.obj"/>
+         </geometry>
+      </visual>
+      <collision name="gripper_right_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/gripper_right_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <!-- The two fingers are coupled 1:1 in the source MJCF (equality/joint polycoef="0 1 0 0 0");
+        opposed axes make them close symmetrically, so one command drives both. -->
+   <joint type="prismatic" name="gripper_right_joint">
+      <parent link="gripper_body"/>
+      <child link="gripper_right"/>
+      <origin xyz="0.06662 0.0 0.005829" rpy="0.0 0.0 0.0"/>
+      <axis xyz="0.0 -1.0 0.0"/>
+      <limit lower="0.0" upper="0.05" effort="5" velocity="100"/>
+      <mimic joint="gripper_left_joint" multiplier="1.0" offset="0.0"/>
+   </joint>
+   <link name="camera">
+      <inertial>
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <mass value="0.1"/>
+         <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+      <visual name="camera_visual">
+         <origin xyz="-0.01063367359559352 5.461803380010684e-05 0.003039582872210959" rpy="1.5716437365592997 0.27800578812372234 0.0030877851067998563"/>
+         <geometry>
+            <mesh filename="meshes/d405.obj"/>
+         </geometry>
+      </visual>
+      <collision name="camera_collision">
+         <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+         <geometry>
+            <mesh filename="meshes/d405_c.stl"/>
+         </geometry>
+      </collision>
+   </link>
+   <joint type="fixed" name="gripper_body2camera_fixed">
+      <parent link="gripper_body"/>
+      <child link="camera"/>
+      <origin xyz="0.021336 0.0 0.0793" rpy="0.0 0.0 0.0"/>
+   </joint>
+   <!-- Grasp reference frame (site "left_gripper_center" in the source MJCF). -->
+   <link name="gripper_center"/>
+   <joint type="fixed" name="gripper_body2gripper_center_fixed">
+      <parent link="gripper_body"/>
+      <child link="gripper_center"/>
+      <origin xyz="0.139591 0.0 0.012214" rpy="0.0 0.0 0.0"/>
+   </joint>
+</robot>
