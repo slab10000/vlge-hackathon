@@ -8,7 +8,12 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 // ---------------------------------------------------------------- config
-const MODEL_URL = './assets/desk.glb';
+// Scenario registry — each entry is a scanned scene the player can hot-swap to
+// (picker buttons top-right, or number keys 1..9). Last choice persists.
+const SCENARIOS = [
+  { id: 'desk',   name: 'Desk',        url: './assets/desk.glb' },
+  { id: 'snacks', name: 'Snack Table', url: './assets/snacks.glb' },
+];
 const WORLD_SIZE = 16;     // normalize largest scene dimension to this many meters (big = desk becomes terrain)
 // If the scan comes out tilted, correct it here (radians), applied X then Y then Z.
 const WORLD_ROTATION = new THREE.Euler(0, 0, 0);
@@ -47,41 +52,69 @@ grid.position.y = -0.01;
 scene.add(grid);
 
 // ---------------------------------------------------------------- collider assembly
-const colliderGeometries = [];
-
-function addColliderGeometry(mesh) {
+function bakeColliderGeometry(mesh) {
   const geom = mesh.geometry.clone();
   geom.applyMatrix4(mesh.matrixWorld);
   for (const name of Object.keys(geom.attributes)) {
     if (name !== 'position') geom.deleteAttribute(name);
   }
-  const flat = geom.index ? geom.toNonIndexed() : geom;
-  colliderGeometries.push(flat);
+  return geom.index ? geom.toNonIndexed() : geom;
 }
 
-// safety ground plane so you can never fall out of the world
-{
+// safety ground plane so you can never fall out of the world (kept across scenario swaps)
+const groundGeometry = (() => {
   const ground = new THREE.Mesh(new THREE.BoxGeometry(WORLD_SIZE * 8, 0.2, WORLD_SIZE * 8));
   ground.position.y = -0.1;
   ground.updateMatrixWorld();
-  addColliderGeometry(ground);
-}
+  return bakeColliderGeometry(ground);
+})();
 
 let collider = null;
-function buildCollider() {
-  const merged = mergeGeometries(colliderGeometries, false);
+function buildCollider(modelGeometries) {
+  if (collider) {
+    scene.remove(collider);
+    collider.geometry.disposeBoundsTree();
+    collider.geometry.dispose();
+  }
+  const merged = mergeGeometries([groundGeometry, ...modelGeometries], false);
   merged.computeBoundsTree();
   collider = new THREE.Mesh(merged);
   collider.visible = false;
   scene.add(collider);
 }
 
-// ---------------------------------------------------------------- model loading
+// ---------------------------------------------------------------- scenario loading
 const overlay = document.getElementById('overlay');
+const loadbar = document.getElementById('loadbar');
 const loadbarFill = document.querySelector('#loadbar div');
 const clicktip = document.getElementById('clicktip');
 const overlaySub = document.querySelector('#overlay .sub');
+const titleName = document.getElementById('titlename');
 let modelReady = false;
+
+// localStorage can throw (cookies blocked, sandboxed iframe) — never let that kill the app
+const storage = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* non-fatal */ } },
+};
+const OVERLAY_SUB_DEFAULT = overlaySub.textContent;
+
+let currentModel = null;
+let activeScenario = null;
+let loadingScenario = null;
+
+function disposeModel(model) {
+  scene.remove(model);
+  model.traverse((o) => {
+    if (!o.isMesh) return;
+    if (o.geometry.boundsTree) o.geometry.disposeBoundsTree();
+    o.geometry.dispose();
+    for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+      for (const v of Object.values(m)) if (v && v.isTexture) v.dispose();
+      m.dispose();
+    }
+  });
+}
 
 // Photogrammetry scans come out slightly tilted (video frames carry no gravity
 // metadata) — measure the dominant upward-facing surface and rotate it level.
@@ -114,63 +147,147 @@ function autoLevel(model) {
   }
 }
 
-new GLTFLoader().load(
-  MODEL_URL,
-  (gltf) => {
-    const model = gltf.scene;
+// normalize + install a loaded scene, replacing whatever is active (hot swap).
+// Throws (before touching the active model) if the scene can't produce a walkable world.
+function installModel(model) {
+  let meshCount = 0;
+  model.traverse((o) => { if (o.isMesh) meshCount++; });
+  if (!meshCount) throw new Error('scene contains no meshes');
+  // normalize: rotate, scale to WORLD_SIZE, center XZ on origin, floor at y=0
+  model.rotation.copy(WORLD_ROTATION);
+  model.updateMatrixWorld(true);
+  autoLevel(model);
+  let box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z);
+  if (!(maxDim > 0) || !isFinite(maxDim)) throw new Error('scene has degenerate bounds');
+  const scale = WORLD_SIZE / maxDim;
+  model.scale.setScalar(scale);
+  model.updateMatrixWorld(true);
+  box = new THREE.Box3().setFromObject(model);
+  const center = box.getCenter(new THREE.Vector3());
+  model.position.x -= center.x;
+  model.position.z -= center.z;
+  model.position.y -= box.min.y;
+  model.updateMatrixWorld(true);
 
-    // normalize: rotate, scale to WORLD_SIZE, center XZ on origin, floor at y=0
-    model.rotation.copy(WORLD_ROTATION);
-    model.updateMatrixWorld(true);
-    autoLevel(model);
-    let box = new THREE.Box3().setFromObject(model);
-    const size = box.getSize(new THREE.Vector3());
-    const scale = WORLD_SIZE / Math.max(size.x, size.y, size.z);
-    model.scale.setScalar(scale);
-    model.updateMatrixWorld(true);
-    box = new THREE.Box3().setFromObject(model);
-    const center = box.getCenter(new THREE.Vector3());
-    model.position.x -= center.x;
-    model.position.z -= center.z;
-    model.position.y -= box.min.y;
-    model.updateMatrixWorld(true);
+  const modelGeometries = [];
+  model.traverse((o) => {
+    if (o.isMesh) {
+      o.material.side = THREE.DoubleSide;
+      modelGeometries.push(bakeColliderGeometry(o));
+    }
+  });
 
-    model.traverse((o) => {
-      if (o.isMesh) {
-        o.material.side = THREE.DoubleSide;
-        addColliderGeometry(o);
-      }
-    });
-    scene.add(model);
-    buildCollider();
+  if (currentModel) disposeModel(currentModel);
+  currentModel = model;
+  scene.add(model);
+  buildCollider(modelGeometries);
 
-    // spawn on top of the scan: raycast down and drop in just above the surface,
-    // so the capsule never starts intersecting geometry
-    box = new THREE.Box3().setFromObject(model);
-    const cx = (box.min.x + box.max.x) / 2;
-    const cz = (box.min.z + box.max.z) / 2;
-    const ray = new THREE.Raycaster(new THREE.Vector3(cx, box.max.y + 5, cz), new THREE.Vector3(0, -1, 0));
-    const hit = ray.intersectObject(model, true)[0];
-    if (hit) SPAWN.set(cx, hit.point.y + 1.6, cz);
-    else SPAWN.set(cx, box.max.y + 2, cz);
-    respawn();
+  // spawn on top of the scan: raycast down and drop in just above the surface,
+  // so the capsule never starts intersecting geometry
+  box = new THREE.Box3().setFromObject(model);
+  const cx = (box.min.x + box.max.x) / 2;
+  const cz = (box.min.z + box.max.z) / 2;
+  const ray = new THREE.Raycaster(new THREE.Vector3(cx, box.max.y + 5, cz), new THREE.Vector3(0, -1, 0));
+  const hit = ray.intersectObject(model, true)[0];
+  if (hit) SPAWN.set(cx, hit.point.y + 1.6, cz);
+  else SPAWN.set(cx, box.max.y + 2, cz);
+  respawn();
+}
+
+const errorTimers = new Map(); // scenario -> pending error-flash reset timeout
+
+function scenarioLoadFailed(scenario, err) {
+  console.error(`scenario "${scenario.id}" load failed`, err);
+  if (loadingScenario === scenario) loadingScenario = null;
+  updateScenarioButtons();
+  const btn = scenarioButtons.get(scenario);
+  if (btn) {
+    btn.classList.add('error');
+    btn.textContent = `${scenario.name} — failed`;
+    clearTimeout(errorTimers.get(scenario));
+    errorTimers.set(scenario, setTimeout(() => {
+      errorTimers.delete(scenario);
+      btn.classList.remove('error');
+      updateScenarioButtons();
+    }, 2500));
+  }
+  if (!currentModel) {
+    // nothing loaded yet — fall back to the empty grid so the world still works
+    overlaySub.textContent = `Could not load ${scenario.url} — run the reconstruction pipeline first. (Walking on the empty grid instead.)`;
+    if (titleName) titleName.textContent = 'Empty grid';
+    buildCollider([]);
     modelReady = true;
-    loadbarFill.style.width = '100%';
-    document.getElementById('loadbar').style.display = 'none';
-    clicktip.style.display = 'block';
-  },
-  (ev) => {
-    if (ev.total) loadbarFill.style.width = `${Math.round((ev.loaded / ev.total) * 100)}%`;
-  },
-  (err) => {
-    console.error('model load failed', err);
-    overlaySub.textContent = 'Could not load assets/desk.glb — run the reconstruction pipeline first. (Walking on the empty grid instead.)';
-    buildCollider();
-    modelReady = true;
-    document.getElementById('loadbar').style.display = 'none';
+    loadbar.style.display = 'none';
     clicktip.style.display = 'block';
   }
-);
+}
+
+function loadScenario(scenario) {
+  if (loadingScenario || scenario === activeScenario) return;
+  loadingScenario = scenario;
+  clearTimeout(errorTimers.get(scenario));
+  errorTimers.delete(scenario);
+  const btn = scenarioButtons.get(scenario);
+  if (btn) btn.classList.remove('error');
+  if (!currentModel && titleName) titleName.textContent = scenario.name;
+  updateScenarioButtons();
+  new GLTFLoader().load(
+    scenario.url,
+    (gltf) => {
+      // GLTFLoader reroutes onLoad exceptions to onError — keep failure handling explicit
+      try {
+        installModel(gltf.scene);
+        activeScenario = scenario;
+        loadingScenario = null;
+        storage.set('scenario', scenario.id);
+        if (titleName) titleName.textContent = scenario.name;
+        overlaySub.textContent = OVERLAY_SUB_DEFAULT;
+        updateScenarioButtons();
+        modelReady = true;
+        loadbarFill.style.width = '100%';
+        loadbar.style.display = 'none';
+        clicktip.style.display = 'block';
+      } catch (e) {
+        scenarioLoadFailed(scenario, e);
+      }
+    },
+    (ev) => {
+      if (!ev.total) return;
+      const pct = Math.round((ev.loaded / ev.total) * 100);
+      loadbarFill.style.width = `${pct}%`;
+      const b = scenarioButtons.get(scenario);
+      if (b) b.textContent = `${scenario.name} ${pct}%`;
+    },
+    (err) => scenarioLoadFailed(scenario, err)
+  );
+}
+
+// ---------------------------------------------------------------- scenario picker UI
+const scenarioPanel = document.getElementById('scenarios');
+const scenarioButtons = new Map();
+SCENARIOS.forEach((sc, i) => {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = sc.name;
+  btn.title = `Switch to ${sc.name} (key ${i + 1})`;
+  btn.addEventListener('click', () => { btn.blur(); loadScenario(sc); });
+  scenarioPanel.appendChild(btn);
+  scenarioButtons.set(sc, btn);
+});
+function updateScenarioButtons() {
+  for (const [sc, btn] of scenarioButtons) {
+    btn.classList.toggle('active', sc === activeScenario);
+    btn.classList.toggle('loading', sc === loadingScenario);
+    if (sc !== loadingScenario && !btn.classList.contains('error')) btn.textContent = sc.name;
+  }
+}
+
+// debug handles (used by headless verification)
+window.__scenarios = SCENARIOS;
+window.__loadScenario = (id) => { const sc = SCENARIOS.find((s) => s.id === id); if (sc) loadScenario(sc); };
+window.__activeScenario = () => (activeScenario ? activeScenario.id : null);
 
 // ---------------------------------------------------------------- player
 const player = {
@@ -193,6 +310,10 @@ addEventListener('keydown', (e) => {
   if (KEY_ALIAS[e.code]) e.preventDefault(); // arrows shouldn't scroll the page
   keys.add(code);
   if (code === 'KeyR') respawn();
+  if (code.startsWith('Digit')) {
+    const sc = SCENARIOS[Number(code.slice(5)) - 1];
+    if (sc) loadScenario(sc); // hot swap without leaving pointer lock
+  }
 });
 addEventListener('keyup', (e) => keys.delete(KEY_ALIAS[e.code] || e.code));
 
@@ -339,6 +460,12 @@ function updatePlayer(delta) {
 }
 
 window.__step = (dt) => updatePlayer(dt); // debug: drive physics without rAF
+
+// ---------------------------------------------------------------- boot
+{
+  const saved = storage.get('scenario');
+  loadScenario(SCENARIOS.find((s) => s.id === saved) || SCENARIOS[0]);
+}
 
 // ---------------------------------------------------------------- loop
 const clock = new THREE.Clock();
