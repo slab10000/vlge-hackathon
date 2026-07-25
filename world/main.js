@@ -11,7 +11,12 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 // ---------------------------------------------------------------- config
-const MODEL_URL = './assets/desk.glb';
+// Scenario registry — each entry is a scanned scene you can hot-swap to
+// (picker buttons top-right, or number keys 1..9). Last choice persists.
+const SCENARIOS = [
+  { id: 'desk',   name: 'Desk',        url: './assets/desk.glb' },
+  { id: 'snacks', name: 'Snack Table', url: './assets/snacks.glb' },
+];
 const WORLD_SIZE = 16;     // normalize largest scene dimension to this many world units
 // If the scan comes out tilted, correct it here (radians), applied X then Y then Z.
 const WORLD_ROTATION = new THREE.Euler(0, 0, 0);
@@ -22,8 +27,13 @@ const WORLD_ROTATION = new THREE.Euler(0, 0, 0);
 const DESK_SPAN_METERS = 1.6;
 const UNITS_PER_METER = WORLD_SIZE / DESK_SPAN_METERS;
 
+// Droppable assets. URDF entries are articulated robots; GLB entries are real
+// objects captured with tools/make_object.py (already in metres, so they inherit
+// UNITS_PER_METER like everything else and land at true physical scale).
 const ASSETS = {
-  so101: { url: './assets/so101/so101_new_calib.urdf', label: 'SO-101' },
+  so101: { url: './assets/so101/so101_new_calib.urdf', label: 'SO-101', kind: 'urdf', icon: '🦾' },
+  bottle: { url: './assets/objects/test_bottle.glb', label: 'Bottle', kind: 'glb', icon: '🍶',
+            note: 'captured object' },
 };
 
 // ---------------------------------------------------------------- scene
@@ -66,33 +76,143 @@ scene.add(grid);
 // ---------------------------------------------------------------- pick surface
 // One merged BVH mesh of everything you can drop something onto. Invisible, but
 // the raycaster still sees it (three only filters by layers, not visibility).
-const colliderGeometries = [];
-
-function addColliderGeometry(mesh) {
+function bakeColliderGeometry(mesh) {
   const geom = mesh.geometry.clone();
   geom.applyMatrix4(mesh.matrixWorld);
   for (const name of Object.keys(geom.attributes)) {
     if (name !== 'position') geom.deleteAttribute(name);
   }
-  colliderGeometries.push(geom.index ? geom.toNonIndexed() : geom);
+  return geom.index ? geom.toNonIndexed() : geom;
 }
 
 // ground plane, so a drop always lands somewhere even off the edge of the scan
-{
+// (kept across scenario swaps — only the scene geometry is rebuilt)
+const groundGeometry = (() => {
   const ground = new THREE.Mesh(new THREE.BoxGeometry(WORLD_SIZE * 8, 0.2, WORLD_SIZE * 8));
   ground.position.y = -0.1;
   ground.updateMatrixWorld();
-  addColliderGeometry(ground);
-}
+  return bakeColliderGeometry(ground);
+})();
 
 let collider = null;
-function buildCollider() {
-  const merged = mergeGeometries(colliderGeometries, false);
+function buildCollider(modelGeometries = []) {
+  if (collider) {
+    scene.remove(collider);
+    collider.geometry.disposeBoundsTree?.();
+    collider.geometry.dispose();
+  }
+  const merged = mergeGeometries([groundGeometry, ...modelGeometries], false);
   merged.computeBoundsTree();
   collider = new THREE.Mesh(merged);
   collider.visible = false;
   collider.name = 'pick-surface';
   scene.add(collider);
+  rebuildPhysicsGround();
+}
+
+// ---------------------------------------------------------------- physics (Rapier)
+// The editor places objects; physics lets them settle realistically. Bodies only
+// exist while simulation is running, so the gizmo and the solver never fight.
+const GRAVITY = -9.81 * UNITS_PER_METER; // world units are not metres
+let phys = null;
+let groundBody = null;
+let simulating = false;
+const simBodies = new Map(); // instance -> rigid body
+
+function rebuildPhysicsGround() {
+  if (!RAPIER || !collider) return;
+  if (!phys) phys = new RAPIER.World({ x: 0, y: GRAVITY, z: 0 });
+  if (groundBody) { phys.removeRigidBody(groundBody); groundBody = null; }
+  const pos = collider.geometry.attributes.position;
+  const idx = new Uint32Array(pos.count);
+  for (let i = 0; i < pos.count; i++) idx[i] = i;
+  groundBody = phys.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+  phys.createCollider(
+    RAPIER.ColliderDesc.trimesh(new Float32Array(pos.array), idx).setFriction(0.9),
+    groundBody
+  );
+}
+
+// convex hull of an instance's meshes, expressed around the instance origin
+function instanceHull(inst) {
+  inst.updateMatrixWorld(true);
+  const origin = new THREE.Vector3().setFromMatrixPosition(inst.matrixWorld);
+  const v = new THREE.Vector3();
+  const pts = [];
+  inst.traverse((o) => {
+    if (!o.isMesh) return;
+    const p = o.geometry.attributes.position;
+    const stride = Math.max(1, Math.floor(p.count / 2000)); // cap hull input cost
+    for (let k = 0; k < p.count; k += stride) {
+      v.fromBufferAttribute(p, k).applyMatrix4(o.matrixWorld).sub(origin);
+      pts.push(v.x, v.y, v.z);
+    }
+  });
+  return pts.length ? new Float32Array(pts) : null;
+}
+
+function startSimulation() {
+  if (!RAPIER || !phys || simulating) return;
+  for (const inst of placed) {
+    const pts = instanceHull(inst);
+    const desc = pts && RAPIER.ColliderDesc.convexHull(pts);
+    if (!desc) continue;
+    const q = inst.quaternion;
+    const body = phys.createRigidBody(
+      RAPIER.RigidBodyDesc.dynamic()
+        .setTranslation(inst.position.x, inst.position.y, inst.position.z)
+        .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
+        .setLinearDamping(0.1).setAngularDamping(0.3)
+    );
+    phys.createCollider(desc.setFriction(0.9).setRestitution(0.05).setDensity(1), body);
+    simBodies.set(inst, body);
+  }
+  simulating = true;
+  select(null);          // gizmo must not fight the solver
+  gizmo.enabled = false;
+  updateSimButton();
+}
+
+function stopSimulation() {
+  if (!simulating) return;
+  for (const [, body] of simBodies) phys.removeRigidBody(body);
+  simBodies.clear();
+  simulating = false;
+  gizmo.enabled = true;
+  updateSimButton();
+}
+
+function toggleSimulation() { simulating ? stopSimulation() : startSimulation(); }
+
+const simButton = document.getElementById('simulate');
+function updateSimButton() {
+  if (!simButton) return;
+  simButton.setAttribute('aria-pressed', String(simulating));
+  simButton.innerHTML = simulating
+    ? '⏸ Stop physics <kbd>P</kbd>'
+    : '▶ Simulate physics <kbd>P</kbd>';
+  simButton.disabled = !RAPIER;
+  simButton.title = RAPIER
+    ? 'Let placed objects fall and settle on the scan'
+    : 'Physics engine unavailable';
+}
+simButton?.addEventListener('click', toggleSimulation);
+updateSimButton();
+
+function stepPhysics() {
+  if (!simulating || !phys) return;
+  phys.step();
+  for (const [inst, body] of simBodies) {
+    const t = body.translation(), r = body.rotation();
+    inst.position.set(t.x, t.y, t.z);
+    inst.quaternion.set(r.x, r.y, r.z, r.w);
+  }
+}
+
+// when the scene swaps, settle whatever is placed onto the new surface
+function respawnProps() {
+  if (simulating) stopSimulation();
+  for (const inst of placed) dropToSurface(inst);
 }
 
 // ---------------------------------------------------------------- editor camera
@@ -120,6 +240,7 @@ scene.add(selectionBox);
 const overlay = document.getElementById('overlay');
 const loadbarFill = document.querySelector('#loadbar div');
 const loadnote = document.getElementById('loadnote');
+const titleName = document.getElementById('titlename');
 let worldModel = null;
 
 // Photogrammetry scans come out slightly tilted (video frames carry no gravity
@@ -153,71 +274,198 @@ function autoLevel(model) {
   }
 }
 
-new GLTFLoader().load(
-  MODEL_URL,
-  (gltf) => {
-    const model = gltf.scene;
+// localStorage can throw (cookies blocked, sandboxed iframe) — never let that kill the app
+const storage = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* non-fatal */ } },
+};
 
-    // normalize: rotate, scale to WORLD_SIZE, center XZ on origin, floor at y=0
-    model.rotation.copy(WORLD_ROTATION);
-    model.updateMatrixWorld(true);
-    autoLevel(model);
-    let box = new THREE.Box3().setFromObject(model);
-    const size = box.getSize(new THREE.Vector3());
-    const scale = WORLD_SIZE / Math.max(size.x, size.y, size.z);
-    model.scale.setScalar(scale);
-    model.updateMatrixWorld(true);
-    box = new THREE.Box3().setFromObject(model);
-    const center = box.getCenter(new THREE.Vector3());
-    model.position.x -= center.x;
-    model.position.z -= center.z;
-    model.position.y -= box.min.y;
-    model.updateMatrixWorld(true);
+let activeScenario = null;
+let loadingScenario = null;
+let bootstrapped = false;
 
-    model.traverse((o) => {
-      if (o.isMesh) {
-        o.material.side = THREE.DoubleSide;
-        addColliderGeometry(o);
+function disposeModel(model) {
+  scene.remove(model);
+  model.traverse((o) => {
+    if (!o.isMesh) return;
+    if (o.geometry.boundsTree) o.geometry.disposeBoundsTree();
+    o.geometry.dispose();
+    for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+      for (const v of Object.values(m)) if (v && v.isTexture) v.dispose();
+      m.dispose();
+    }
+  });
+}
+
+// normalize + install a loaded scene, replacing whatever is active (hot swap).
+// Throws BEFORE touching the active model if the scene can't produce a world,
+// so a bad swap leaves the current one standing.
+function installModel(model) {
+  let meshCount = 0;
+  model.traverse((o) => { if (o.isMesh) meshCount++; });
+  if (!meshCount) throw new Error('scene contains no meshes');
+
+  // normalize: rotate, scale to WORLD_SIZE, center XZ on origin, floor at y=0
+  model.rotation.copy(WORLD_ROTATION);
+  model.updateMatrixWorld(true);
+  autoLevel(model);
+  let box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z);
+  if (!(maxDim > 0) || !isFinite(maxDim)) throw new Error('scene has degenerate bounds');
+  model.scale.setScalar(WORLD_SIZE / maxDim);
+  model.updateMatrixWorld(true);
+  box = new THREE.Box3().setFromObject(model);
+  const center = box.getCenter(new THREE.Vector3());
+  model.position.x -= center.x;
+  model.position.z -= center.z;
+  model.position.y -= box.min.y;
+  model.updateMatrixWorld(true);
+
+  const modelGeometries = [];
+  model.traverse((o) => {
+    if (o.isMesh) {
+      o.material.side = THREE.DoubleSide;
+      modelGeometries.push(bakeColliderGeometry(o));
+    }
+  });
+
+  if (worldModel) disposeModel(worldModel);
+  worldModel = model;
+  scene.add(model);
+  buildCollider(modelGeometries);
+  return new THREE.Box3().setFromObject(model);
+}
+
+function loadScenario(scenario, { frame = true } = {}) {
+  if (loadingScenario || scenario === activeScenario) return;
+  loadingScenario = scenario;
+  updateScenarioButtons();
+  loadnote.textContent = `loading ${scenario.name.toLowerCase()}…`;
+
+  new GLTFLoader().load(
+    scenario.url,
+    (gltf) => {
+      try {
+        const box = installModel(gltf.scene);
+        activeScenario = scenario;
+        loadingScenario = null;
+        storage.set('scenario', scenario.id);
+        titleName.textContent = scenario.name;
+        updateScenarioButtons();
+        if (frame) controls.frame(box, { yaw: 0.6, pitch: -0.5 });
+        respawnProps();
+        if (!bootstrapped) { bootstrapped = true; worldReady(); }
+        else loadnote.textContent = '';
+      } catch (err) {
+        scenarioLoadFailed(scenario, err);
       }
-    });
-    scene.add(model);
-    worldModel = model;
-    buildCollider();
-    controls.frame(new THREE.Box3().setFromObject(model), { yaw: 0.6, pitch: -0.5 });
-    worldReady();
-  },
-  (ev) => {
-    if (ev.total) loadbarFill.style.width = `${Math.round((ev.loaded / ev.total) * 55)}%`;
-  },
-  (err) => {
-    console.error('model load failed', err);
-    buildCollider();
-    worldReady('Could not load assets/desk.glb — dropping assets onto the empty grid instead.');
+    },
+    (ev) => {
+      if (ev.total) loadbarFill.style.width = `${Math.round((ev.loaded / ev.total) * 55)}%`;
+    },
+    (err) => scenarioLoadFailed(scenario, err)
+  );
+}
+
+const errorTimers = new Map();
+
+function scenarioLoadFailed(scenario, err) {
+  console.error(`scenario "${scenario.id}" load failed`, err);
+  if (loadingScenario === scenario) loadingScenario = null;
+  updateScenarioButtons();
+  const btn = scenarioButtons.get(scenario);
+  if (btn) {
+    btn.dataset.error = 'true';
+    clearTimeout(errorTimers.get(scenario));
+    errorTimers.set(scenario, setTimeout(() => { delete btn.dataset.error; }, 2000));
   }
-);
+  if (!bootstrapped) {
+    bootstrapped = true;
+    buildCollider();
+    worldReady(`Could not load ${scenario.url} — dropping assets onto the empty grid instead.`);
+  } else {
+    loadnote.textContent = `could not load ${scenario.name}`;
+  }
+}
+
+// ---------------------------------------------------------------- scenario picker
+const scenarioPanel = document.getElementById('scenarios');
+const scenarioButtons = new Map();
+
+function updateScenarioButtons() {
+  for (const [scenario, btn] of scenarioButtons) {
+    btn.setAttribute('aria-pressed', String(scenario === activeScenario));
+    btn.disabled = !!loadingScenario;
+    btn.classList.toggle('loading', scenario === loadingScenario);
+  }
+}
+
+if (scenarioPanel) {
+  SCENARIOS.forEach((scenario, i) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.innerHTML = `${scenario.name} <kbd>${i + 1}</kbd>`;
+    btn.addEventListener('click', () => loadScenario(scenario));
+    scenarioPanel.appendChild(btn);
+    scenarioButtons.set(scenario, btn);
+  });
+}
+
+const remembered = SCENARIOS.find((s) => s.id === storage.get('scenario')) || SCENARIOS[0];
+loadScenario(remembered);
+
+// A captured GLB behaves like a URDF asset as far as the editor cares: it just
+// needs a build() that returns a fresh object (optionally in a ghost material).
+function loadGLBAsset(url) {
+  return new Promise((resolve, reject) => {
+    new GLTFLoader().load(url, (gltf) => {
+      const source = gltf.scene;
+      source.updateMatrixWorld(true);
+      resolve({
+        spec: null,
+        build(material) {
+          const copy = source.clone(true);
+          if (material) copy.traverse((o) => { if (o.isMesh) o.material = material; });
+          return copy;
+        },
+      });
+    }, undefined, reject);
+  });
+}
 
 function worldReady(warning) {
   loadbarFill.style.width = '60%';
   loadnote.textContent = warning || 'loading SO-101 meshes…';
-  loadURDF(ASSETS.so101.url, {
-    onProgress: (done, total) => {
-      loadbarFill.style.width = `${60 + Math.round((done / total) * 40)}%`;
-      loadnote.textContent = `loading SO-101 meshes… ${done}/${total}`;
-    },
-  })
-    .then((asset) => {
-      ASSETS.so101.asset = asset;
-      buildGhost(asset);
-      shelfItem.setAttribute('draggable', 'true');
-      shelfItem.setAttribute('aria-disabled', 'false');
-      shelfStatus.textContent = `${asset.spec.joints.filter((j) => j.type !== 'fixed').length} joints · URDF`;
-      dismissOverlay();
-    })
-    .catch((err) => {
-      console.error('URDF load failed', err);
-      shelfStatus.textContent = 'failed to load';
-      dismissOverlay();
-    });
+
+  const jobs = Object.entries(ASSETS).map(([key, entry]) => {
+    const loading = entry.kind === 'urdf'
+      ? loadURDF(entry.url, {
+          onProgress: (done, total) => {
+            loadbarFill.style.width = `${60 + Math.round((done / total) * 40)}%`;
+            loadnote.textContent = `loading ${entry.label} meshes… ${done}/${total}`;
+          },
+        })
+      : loadGLBAsset(entry.url);
+
+    return loading
+      .then((asset) => {
+        entry.asset = asset;
+        const joints = asset.spec?.joints?.filter((j) => j.type !== 'fixed').length;
+        markAssetReady(key, joints != null ? `${joints} joints · URDF` : (entry.note || 'GLB'));
+      })
+      .catch((err) => {
+        console.error(`asset "${key}" failed to load`, err);
+        const ui = shelfCards.get(key);
+        if (ui) ui.status.textContent = 'failed to load';
+      });
+  });
+
+  Promise.allSettled(jobs).then(() => {
+    const firstReady = Object.keys(ASSETS).find((k) => ASSETS[k].asset);
+    if (firstReady) buildGhost(firstReady);
+    dismissOverlay();
+  });
 }
 
 function dismissOverlay() {
@@ -282,17 +530,22 @@ const ghostRing = new THREE.Mesh(
   new THREE.MeshBasicMaterial({ color: 0x7fd4ff, transparent: true, opacity: 0.55, side: THREE.DoubleSide, depthTest: false })
 );
 
-function buildGhost(asset) {
-  const robot = asset.build(ghostMaterial);
-  robot.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(robot);
-  robot.position.y = -box.min.y;
+let ghostKey = null;
+function buildGhost(key) {
+  const entry = ASSETS[key];
+  if (!entry || !entry.asset || ghostKey === key) return;
+  if (ghost) { scene.remove(ghost); ghost.remove(ghostRing); }
+  const body = entry.asset.build(ghostMaterial);
+  body.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(body);
+  body.position.y = -box.min.y;
   ghost = new THREE.Group();
   ghost.scale.setScalar(UNITS_PER_METER);
   ghost.visible = false;
-  ghost.add(robot);
+  ghost.add(body);
   ghost.add(ghostRing);
   scene.add(ghost);
+  ghostKey = key;
 }
 
 // ---------------------------------------------------------------- picking
@@ -357,9 +610,47 @@ function select(inst) {
   refreshInspector();
 }
 
+// ---------------------------------------------------------------- asset shelf
+const shelfList = document.getElementById('shelf-items');
+const shelfCards = new Map(); // key -> { card, status }
+
+for (const [key, entry] of Object.entries(ASSETS)) {
+  const card = document.createElement('div');
+  card.className = 'asset';
+  card.setAttribute('aria-disabled', 'true');
+  card.title = `${entry.label} (${entry.kind.toUpperCase()})`;
+  card.innerHTML =
+    `<div class="thumb">${entry.icon || '📦'}</div>` +
+    `<div class="meta"><b>${entry.label}</b><span>loading…</span></div>`;
+  shelfList.appendChild(card);
+  shelfCards.set(key, { card, status: card.querySelector('.meta span') });
+
+  card.addEventListener('dragstart', (e) => {
+    if (!entry.asset) { e.preventDefault(); return; }
+    buildGhost(key);
+    e.dataTransfer.setData('text/plain', key);
+    e.dataTransfer.effectAllowed = 'copy';
+  });
+  card.addEventListener('dragend', () => { if (ghost) ghost.visible = false; });
+  card.addEventListener('click', () => {
+    if (!entry.asset) return;
+    buildGhost(key);
+    const rect = renderer.domElement.getBoundingClientRect();
+    const fake = { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+    const p = placementFromEvent(fake) || controls.pivot.clone();
+    addInstance(key, p, facingYaw());
+  });
+}
+
+function markAssetReady(key, note) {
+  const ui = shelfCards.get(key);
+  if (!ui) return;
+  ui.card.setAttribute('draggable', 'true');
+  ui.card.setAttribute('aria-disabled', 'false');
+  ui.status.textContent = note;
+}
+
 // ---------------------------------------------------------------- pointer input
-const shelfItem = document.getElementById('asset-so101');
-const shelfStatus = document.getElementById('asset-so101-status');
 
 let objDrag = null;      // { inst, offsetX, offsetZ, startX, startY, moved }
 let clickCandidate = null;
@@ -431,13 +722,6 @@ function placementFromEvent(e) {
   return raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p) ? p : null;
 }
 
-shelfItem.addEventListener('dragstart', (e) => {
-  if (!ASSETS.so101.asset) { e.preventDefault(); return; }
-  e.dataTransfer.setData('text/plain', 'so101');
-  e.dataTransfer.effectAllowed = 'copy';
-});
-shelfItem.addEventListener('dragend', () => { if (ghost) ghost.visible = false; });
-
 renderer.domElement.addEventListener('dragover', (e) => {
   if (!ghost) return;
   e.preventDefault();
@@ -450,17 +734,9 @@ renderer.domElement.addEventListener('dragleave', () => { if (ghost) ghost.visib
 renderer.domElement.addEventListener('drop', (e) => {
   e.preventDefault();
   if (ghost) ghost.visible = false;
+  const key = e.dataTransfer.getData('text/plain');
   const p = placementFromEvent(e);
-  if (p) addInstance('so101', p, facingYaw());
-});
-
-// click the shelf card to place one in front of the camera
-shelfItem.addEventListener('click', () => {
-  if (!ASSETS.so101.asset) return;
-  const rect = renderer.domElement.getBoundingClientRect();
-  const fake = { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
-  const p = placementFromEvent(fake) || controls.pivot.clone();
-  addInstance('so101', p, facingYaw());
+  if (p && ASSETS[key]?.asset) addInstance(key, p, facingYaw());
 });
 
 // ---------------------------------------------------------------- keyboard
@@ -471,11 +747,19 @@ addEventListener('keydown', (e) => {
   if (e.metaKey || e.ctrlKey) return;
   if (controls.flying) return; // WASD belongs to the fly camera while RMB is down
 
+  // 1..9 hot-swap scenarios
+  if (/^Digit[1-9]$/.test(e.code)) {
+    const scenario = SCENARIOS[Number(e.code.slice(5)) - 1];
+    if (scenario) { e.preventDefault(); loadScenario(scenario); }
+    return;
+  }
+
   switch (e.code) {
     case 'KeyG': setMode('translate'); break;
     case 'KeyR': setMode('rotate'); break;
     case 'KeyS': setMode('scale'); break;
     case 'KeyF': frameSelection(); break;
+    case 'KeyP': toggleSimulation(); break;
     case 'Home': frameAll(); break;
     case 'Escape': select(null); break;
     case 'KeyD':
@@ -615,9 +899,15 @@ const clock = new THREE.Clock();
 function animate() {
   requestAnimationFrame(animate);
   controls.update(Math.min(clock.getDelta(), 0.05));
+  stepPhysics();
+  if (selection) selectionBox.setFromObject(selection);
   renderer.render(scene, camera);
 }
 animate();
+
+// debug: drive physics without rAF (hidden tabs pause rAF)
+window.__stepPhysics = (n = 1) => { for (let i = 0; i < n; i++) stepPhysics(); };
+window.__sim = { start: startSimulation, stop: stopSimulation, bodies: simBodies, placed };
 
 function onViewportChange() {
   const { w, h } = viewportSize();
