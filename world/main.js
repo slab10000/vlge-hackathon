@@ -204,15 +204,29 @@ function buildCollider(modelGeometries = []) {
 // The editor places objects; physics lets them settle realistically. Bodies only
 // exist while simulation is running, so the gizmo and the solver never fight.
 const GRAVITY = -9.81 * UNITS_PER_METER; // world units are not metres
+// A pinch grip is friction doing all the work: the jaws only ever squeeze, so
+// what holds the object up is the friction cone at two small contact patches.
+// Rubber-on-plastic is around 1.0 — the jaw pads are grippier than bare PLA, and
+// combining with Max (not the default average) means one slick prop cannot
+// halve the grip on its own.
+const GRIP_FRICTION = 1.4;
+// The default 4 velocity iterations let a squeezed object creep out between the
+// jaws; contacts on opposite faces have to be solved against each other enough
+// times to agree on a single held pose.
+const SOLVER_ITERATIONS = 12;
 let phys = null;
 let groundBody = null;
 let simulating = false;
 const simBodies = new Map(); // instance -> rigid body
 const armBodies = [];        // { link, body } — one kinematic body per robot link
+const colliderToProp = new Map();  // collider handle -> prop rigid body
 
 function rebuildPhysicsGround() {
   if (!RAPIER || !collider) return;
-  if (!phys) phys = new RAPIER.World({ x: 0, y: GRAVITY, z: 0 });
+  if (!phys) {
+    phys = new RAPIER.World({ x: 0, y: GRAVITY, z: 0 });
+    phys.numSolverIterations = SOLVER_ITERATIONS;
+  }
   if (groundBody) { phys.removeRigidBody(groundBody); groundBody = null; }
   const pos = collider.geometry.attributes.position;
   const idx = new Uint32Array(pos.count);
@@ -224,12 +238,21 @@ function rebuildPhysicsGround() {
   );
 }
 
+// A Rapier collider has a position and a rotation but no scale, so hull points
+// must carry the instance's scale themselves. Inverting the full matrixWorld
+// would divide it straight back out (a ×10 instance would get a 10×-too-small
+// collider), so we invert only the rigid part and leave scale baked into the
+// points — the frame a collider actually lives in.
+const _unitScale = new THREE.Vector3(1, 1, 1);
+function rigidInverse(matrixWorld, pos, quat) {
+  matrixWorld.decompose(pos, quat, new THREE.Vector3());
+  return new THREE.Matrix4().compose(pos, quat, _unitScale).invert();
+}
+
 // Convex hull of one URDF link's own visuals — the child links hanging off it
-// get their own bodies, so their meshes must not bleed into this hull. Points
-// come back in the link's own frame (world scale baked in, rotation removed),
-// which is exactly the frame a Rapier collider sits in.
-function linkHull(link, allLinks) {
-  const m = new THREE.Matrix4().copy(link.matrixWorld).invert();
+// get their own bodies, so their meshes must not bleed into this hull.
+function linkHull(link, allLinks, pos, quat) {
+  const m = rigidInverse(link.matrixWorld, pos, quat);
   const v = new THREE.Vector3();
   const pts = [];
   const walk = (o) => {
@@ -256,26 +279,187 @@ function addArmBodies(inst) {
   const robot = inst.userData.robot;
   inst.updateMatrixWorld(true);
   const allLinks = new Set(robot.links.values());
-  const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scl = new THREE.Vector3();
+  const pos = new THREE.Vector3(), quat = new THREE.Quaternion();
+  const byLink = new Map();
   for (const link of allLinks) {
-    const pts = linkHull(link, allLinks);
+    const pts = linkHull(link, allLinks, pos, quat);   // fills pos/quat from the link
     if (!pts) continue;
     let desc;
     try { desc = RAPIER.ColliderDesc.convexHull(pts); } catch { desc = null; }
     if (!desc) continue;                              // degenerate/coplanar link
-    link.matrixWorld.decompose(pos, quat, scl);
     const body = phys.createRigidBody(
       RAPIER.RigidBodyDesc.kinematicPositionBased()
         .setTranslation(pos.x, pos.y, pos.z)
         .setRotation({ x: quat.x, y: quat.y, z: quat.z, w: quat.w })
     );
-    phys.createCollider(desc.setFriction(0.9).setRestitution(0.05), body);
-    armBodies.push({ link, body });
+    phys.createCollider(
+      desc.setFriction(GRIP_FRICTION)
+        .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Max)
+        .setRestitution(0),          // a bouncy jaw flicks the object out of reach
+      body
+    );
+    const entry = { link, body, centroid: hullCentroid(pts) };
+    armBodies.push(entry);
+    byLink.set(link, entry);
+  }
+  const grip = gripperOf(robot, byLink);
+  if (grip) armGrips.push(grip);
+}
+
+// mean of the hull points — a stable per-jaw reference the body pose can carry
+function hullCentroid(pts) {
+  const c = new THREE.Vector3();
+  for (let i = 0; i < pts.length; i += 3) c.x += pts[i], c.y += pts[i + 1], c.z += pts[i + 2];
+  return c.multiplyScalar(3 / pts.length);
+}
+
+// ---------------------------------------------------------------- grasping
+// Position-controlled jaws cannot hold anything by friction: the solver only
+// generates enough normal force to stop the overlap it sees this step, so a jaw
+// that has stopped moving squeezes with ~nothing and the object slides straight
+// out. Every robot sim solves this the same way — notice the pinch, then weld
+// the object to the hand until the jaws open again.
+//
+// Detection has to survive two different gripper builds: the SO-101 swings one
+// jaw against a fixed finger on the palm, the Piper drives two jaws in and out
+// symmetrically. So a pinch is "the object touches two different parts of the
+// hand, at least one of which moves" — true for both.
+const JAW_RE = /grip|jaw|finger|claw/i;
+const armGrips = [];      // one per placed arm
+const RELEASE_FRACTION = 0.25;   // of full jaw travel, before a held object drops
+const OPEN_MARGIN = 0.15;        // of full jaw travel; nearer than this to wide open is "not gripping"
+
+function gripperOf(robot, byLink) {
+  const links = new Set(robot.links.values());
+  const jaws = [], palms = new Set(), joints = [];
+  for (const [name, j] of robot.joints) {
+    const child = j.node.children.find((c) => links.has(c));
+    if (!child) continue;
+    if (!JAW_RE.test(name) && !JAW_RE.test(child.name)) continue;
+    // A jaw is the end of its chain. Without this the SO-101's `gripper_link`
+    // qualifies on name alone and the hand's "spread" ends up measuring wrist
+    // roll, which never opens anything.
+    if (child.children.some((c) => c.children.some((g) => links.has(g)))) continue;
+    const parent = j.node.parent;
+    if (byLink.has(child)) jaws.push(byLink.get(child));
+    if (byLink.has(parent)) palms.add(byLink.get(parent));
+    joints.push({ name, j });
+  }
+  if (!jaws.length) return null;
+  const parts = [...new Set([...jaws, ...palms])];
+  if (parts.length < 2) return null;         // nothing to pinch against
+  const grip = { robot, jaws, parts, joints, held: null, latchOpen: 0, cooldown: 0 };
+  measureJawTravel(grip);          // sets grip.travel and grip.openMax
+  return grip;
+}
+
+// How far the hand opens, in world units, measured by driving the jaw joints to
+// each limit. Gives the release threshold a scale that suits the actual robot
+// rather than a magic constant that only fits one of them.
+function measureJawTravel(grip) {
+  const saved = grip.joints.map(({ j }) => j.value);
+  const at = (pick) => {
+    for (const { name, j } of grip.joints) grip.robot.setJointValue(name, pick(j));
+    grip.robot.updateMatrixWorld(true);
+    return openness(grip, true);
+  };
+  const lo = at((j) => j.lower), hi = at((j) => j.upper);
+  grip.joints.forEach(({ name }, i) => grip.robot.setJointValue(name, saved[i]));
+  grip.robot.updateMatrixWorld(true);
+  grip.travel = Math.abs(hi - lo);
+  grip.openMax = Math.max(lo, hi);
+  return grip.travel;
+}
+
+// Spread of the hand: total distance from each jaw to the other parts. Read off
+// geometry rather than joint angle, so it needs no per-robot sign convention for
+// which way "closed" is.
+const _oA = new THREE.Vector3(), _oB = new THREE.Vector3();
+function openness(grip, fromLinks = false) {
+  const place = (entry, out) => {
+    if (fromLinks) {
+      entry.link.matrixWorld.decompose(_armPos, _armQuat, _armScl);
+      return out.copy(entry.centroid).applyQuaternion(_armQuat).add(_armPos);
+    }
+    const t = entry.body.translation(), r = entry.body.rotation();
+    return out.copy(entry.centroid)
+      .applyQuaternion(_armQuat.set(r.x, r.y, r.z, r.w))
+      .add(_armPos.set(t.x, t.y, t.z));
+  };
+  let total = 0;
+  for (const jaw of grip.jaws) {
+    place(jaw, _oA);
+    for (const other of grip.parts) {
+      if (other === jaw) continue;
+      total += _oA.distanceTo(place(other, _oB));
+    }
+  }
+  return total;
+}
+
+function latchGrasp(grip, part, propBody) {
+  const t1 = part.body.translation(), r1 = part.body.rotation();
+  const t2 = propBody.translation(), r2 = propBody.rotation();
+  const q1inv = new THREE.Quaternion(r1.x, r1.y, r1.z, r1.w).invert();
+  const anchor1 = new THREE.Vector3(t2.x - t1.x, t2.y - t1.y, t2.z - t1.z).applyQuaternion(q1inv);
+  const frame1 = q1inv.clone().multiply(new THREE.Quaternion(r2.x, r2.y, r2.z, r2.w));
+  const joint = phys.createImpulseJoint(
+    RAPIER.JointData.fixed(anchor1, frame1, { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0, w: 1 }),
+    part.body, propBody, true
+  );
+  grip.held = { joint, propBody };
+  grip.latchOpen = openness(grip);
+}
+
+function releaseGrasp(grip) {
+  if (!grip.held) return;
+  phys.removeImpulseJoint(grip.held.joint, true);
+  grip.held = null;
+  grip.cooldown = 20;      // let the object clear the jaws before it can re-latch
+}
+
+function updateGrasps() {
+  if (!armGrips.length) return;
+  for (const grip of armGrips) {
+    if (grip.cooldown > 0) grip.cooldown--;
+    if (grip.held) {
+      // Measured against how much opening is actually LEFT, not full travel: a
+      // fat object stops the jaws early, so a fraction of full travel can be a
+      // threshold the hand physically cannot reach. The floor keeps solver
+      // jitter from counting as letting go.
+      const room = grip.openMax - grip.latchOpen;
+      const slack = Math.max(room * RELEASE_FRACTION, grip.travel * 0.05);
+      if (openness(grip) > grip.latchOpen + slack) releaseGrasp(grip);
+      continue;
+    }
+    if (grip.cooldown > 0) continue;
+    // A hand standing wide open has not grabbed anything, however much of it the
+    // object happens to be resting against — otherwise letting go of something
+    // that stays nestled between the fingers instantly grabs it again.
+    if (openness(grip) > grip.openMax - grip.travel * OPEN_MARGIN) continue;
+    // how many distinct parts of the hand is each prop touching?
+    const hits = new Map();
+    for (const part of grip.parts) {
+      phys.contactPairsWith(part.body.collider(0), (other) => {
+        const prop = colliderToProp.get(other.handle);
+        if (!prop) return;
+        const seen = hits.get(prop) || { parts: new Set(), jaw: false };
+        seen.parts.add(part);
+        if (grip.jaws.includes(part)) seen.jaw = true;
+        hits.set(prop, seen);
+      });
+    }
+    for (const [propBody, seen] of hits) {
+      if (seen.parts.size < 2 || !seen.jaw) continue;
+      latchGrasp(grip, grip.jaws[0], propBody);
+      break;
+    }
   }
 }
 
 // push the current pose into the kinematic bodies, ahead of the solver step
 const _armPos = new THREE.Vector3(), _armQuat = new THREE.Quaternion(), _armScl = new THREE.Vector3();
+const _propPos = new THREE.Vector3(), _propQuat = new THREE.Quaternion();
 function syncArmBodies() {
   if (!armBodies.length) return;
   // the joint stream re-poses arms between renders, so refresh before reading
@@ -287,10 +471,14 @@ function syncArmBodies() {
   }
 }
 
-// convex hull of an instance's meshes, expressed around the instance origin
-function instanceHull(inst) {
+// Convex hull of an instance's meshes, in the instance's own collider frame.
+// Subtracting the origin alone would leave the points still turned into world
+// space, and the body then applies that rotation a second time — a yawed prop
+// would get a collider skewed away from its mesh, which is fatal once a gripper
+// is trying to close on it.
+function instanceHull(inst, pos, quat) {
   inst.updateMatrixWorld(true);
-  const origin = new THREE.Vector3().setFromMatrixPosition(inst.matrixWorld);
+  const m = rigidInverse(inst.matrixWorld, pos, quat);
   const v = new THREE.Vector3();
   const pts = [];
   inst.traverse((o) => {
@@ -298,7 +486,7 @@ function instanceHull(inst) {
     const p = o.geometry.attributes.position;
     const stride = Math.max(1, Math.floor(p.count / 2000)); // cap hull input cost
     for (let k = 0; k < p.count; k += stride) {
-      v.fromBufferAttribute(p, k).applyMatrix4(o.matrixWorld).sub(origin);
+      v.fromBufferAttribute(p, k).applyMatrix4(o.matrixWorld).applyMatrix4(m);
       pts.push(v.x, v.y, v.z);
     }
   });
@@ -310,18 +498,26 @@ function startSimulation() {
   for (const inst of placed) {
     // articulated arms are clamped in place; loose props fall
     if (inst.userData.robot?.isURDFRobot) { addArmBodies(inst); continue; }
-    const pts = instanceHull(inst);
+    const pts = instanceHull(inst, _propPos, _propQuat);
     const desc = pts && RAPIER.ColliderDesc.convexHull(pts);
     if (!desc) continue;
-    const q = inst.quaternion;
     const body = phys.createRigidBody(
       RAPIER.RigidBodyDesc.dynamic()
-        .setTranslation(inst.position.x, inst.position.y, inst.position.z)
-        .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
+        .setTranslation(_propPos.x, _propPos.y, _propPos.z)
+        .setRotation({ x: _propQuat.x, y: _propQuat.y, z: _propQuat.z, w: _propQuat.w })
         .setLinearDamping(0.1).setAngularDamping(0.3)
+        // jaws sweep fast enough to step over a thin object in one tick, and a
+        // held object must not doze off while the arm carries it
+        .setCcdEnabled(true).setCanSleep(false)
     );
-    phys.createCollider(desc.setFriction(0.9).setRestitution(0.05).setDensity(1), body);
+    const col = phys.createCollider(
+      desc.setFriction(GRIP_FRICTION)
+        .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Max)
+        .setRestitution(0).setDensity(1),
+      body
+    );
     simBodies.set(inst, body);
+    colliderToProp.set(col.handle, body);
   }
   simulating = true;
   select(null);          // gizmo must not fight the solver
@@ -331,8 +527,11 @@ function startSimulation() {
 
 function stopSimulation() {
   if (!simulating) return;
+  for (const grip of armGrips) grip.held = null;   // bodies go with the joints
+  armGrips.length = 0;
   for (const [, body] of simBodies) phys.removeRigidBody(body);
   simBodies.clear();
+  colliderToProp.clear();
   for (const { body } of armBodies) phys.removeRigidBody(body);
   armBodies.length = 0;
   simulating = false;
@@ -361,6 +560,7 @@ function stepPhysics() {
   if (!simulating || !phys) return;
   syncArmBodies();       // live joint stream may have re-posed the arms since last step
   phys.step();
+  updateGrasps();
   for (const [inst, body] of simBodies) {
     const t = body.translation(), r = body.rotation();
     inst.position.set(t.x, t.y, t.z);
@@ -1836,7 +2036,10 @@ animate();
 
 // debug: drive physics without rAF (hidden tabs pause rAF)
 window.__stepPhysics = (n = 1) => { for (let i = 0; i < n; i++) stepPhysics(); };
-window.__sim = { start: startSimulation, stop: stopSimulation, bodies: simBodies, armBodies, placed };
+window.__sim = {
+  start: startSimulation, stop: stopSimulation, bodies: simBodies, armBodies, armGrips, placed,
+  get world() { return phys; },
+};
 
 function onViewportChange() {
   const { w, h } = viewportSize();
