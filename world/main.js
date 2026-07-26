@@ -48,9 +48,11 @@ const UNITS_PER_METER = WORLD_SIZE / DESK_SPAN_METERS;
 const ASSETS = {
   so101: {
     url: './assets/so101/so101_new_calib.urdf', label: 'SO-101', kind: 'urdf', icon: '🦾',
-    // camera_link IS the optical frame here (the URDF says so): OpenCV / REP-104,
-    // +z along the lens, +x right, +y down. A half-turn about x flips it into
-    // three.js's convention (+y up, -z forward).
+    // camera_link IS the optical frame here: the lens looks along its +z (OpenCV /
+    // REP-104, +x right, +y down), and camera_joint carries whatever downward tilt
+    // the real bracket has. A three.js camera looks down its own -z, so a half-turn
+    // about x is the whole conversion — keep the aim in the URDF, not here, so a
+    // re-tilt upstream lands by copying the file.
     camera: {
       link: 'camera_link',
       rpy: [Math.PI, 0, 0],
